@@ -1,0 +1,364 @@
+{
+  "info": {
+    "name": "Allocate.AI API Collection",
+    "description": "Complete API collection for testing Allocate.AI backend\n\nBase URL: http://localhost:8002\nSession Token: my-test-session-123",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "1. Health Check",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8002/health",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["health"]
+            },
+            "description": "Check if server is running.\n\n**No authentication required.**\n\n**Expected Response:**\n```json\n{\n  \"status\": \"healthy\",\n  \"timestamp\": \"2026-05-19T...\",\n  \"version\": \"0.1.0\"\n}\n```"
+          }
+        },
+        {
+          "name": "GET /ready",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "http://localhost:8002/ready",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["ready"]
+            },
+            "description": "Check if server AND database are ready.\n\n**Expected Response:**\n```json\n{\n  \"status\": \"ready\",\n  \"checks\": {\n    \"database\": true\n  }\n}\n```"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Run Management",
+      "item": [
+        {
+          "name": "POST Create New Run",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"customer_name\": \"BMW Group\",\n  \"industry\": \"Automotive\",\n  \"brand_kpi\": \"adaware\",\n  \"media_channels\": [\"TV\", \"ONLINE\", \"SOCIAL\"],\n  \"goal_direction\": \"budget_to_impact\",\n  \"goal_text\": \"I have 4 million euros for Q3 brand awareness campaign\",\n  \"total_budget\": 4000000\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs"]
+            },
+            "description": "Create a new budget allocation request.\n\n**Required Headers:**\n- X-Session-Token: Your session identifier\n\n**Body Fields:**\n- customer_name: Company name\n- industry: Business sector\n- brand_kpi: adaware | aided | consider\n- media_channels: Array of channels\n- goal_direction: budget_to_impact | goal_to_budget\n- goal_text: Description of your goal\n- total_budget: Amount in EUR\n\n**IMPORTANT:** Note the 'id' in response - use it for all other requests!"
+          }
+        },
+        {
+          "name": "GET Run Status (run_id=1)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/status",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "status"]
+            },
+            "description": "Check the status of your run.\n\n**Change the '1' in URL to your run_id**\n\n**Status Values:**\n- pending: Waiting to start\n- matching: Finding competitors\n- awaiting_confirmation: Need to approve competitors\n- generating: AI is working\n- completed: Done!\n- failed: Error occurred\n- cancelled: User stopped it"
+          }
+        },
+        {
+          "name": "POST Stop Run (run_id=1)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"User cancelled the request\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/stop",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "stop"]
+            },
+            "description": "Cancel a running or queued request.\n\n**Change the '1' in URL to your run_id**"
+          }
+        },
+        {
+          "name": "POST Process Run (run_id=1) - MOCK (hardcoded)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/process",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "process"]
+            },
+            "description": "**MOCK - Uses hardcoded values (no AI)**\n\nThis endpoint manually processes a run with FAKE data.\n\n**Change the '1' in URL to your run_id**\n\n**Returns fixed allocation:**\n- TV: 37%\n- Online: 28%\n- Social: 22%\n- OOH: 13%\n\n**Use /process-ai instead for REAL AI!**"
+          }
+        },
+        {
+          "name": "POST Process Run with REAL AI (run_id=1)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/process-ai",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "process-ai"]
+            },
+            "description": "**REAL AI - Calls OpenAI GPT-4o!**\n\nThis endpoint triggers the REAL AI pipeline:\n1. Assembles prompt with expert knowledge\n2. Calls OpenAI GPT-4o\n3. Parses and validates response\n4. Generates intelligent feedback\n\n**Change the '1' in URL to your run_id**\n\n**Response time:** 5-15 seconds\n\n**Response includes:**\n- ai_powered: true\n- model: gpt-4o-2024-08-06\n- tokens_used: actual token count\n- latency_ms: API response time\n- confidence: AI's confidence (0-1)\n- allocation_summary: AI-generated allocation\n\n**Note:** Requires valid OPENAI_API_KEY in .env"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Competitors",
+      "item": [
+        {
+          "name": "GET Competitors (run_id=1)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/competitors",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "competitors"]
+            },
+            "description": "Get the list of matched competitor brands.\n\n**Change the '1' in URL to your run_id**\n\nShows which brands the AI will analyze."
+          }
+        },
+        {
+          "name": "POST Confirm Competitors - APPROVE (run_id=1)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"approve\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/competitors/confirm",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "competitors", "confirm"]
+            },
+            "description": "Approve the competitor list and continue.\n\n**Change the '1' in URL to your run_id**\n\n**Actions:**\n- approve: Continue with these competitors\n- cancel: Reject and stop the run"
+          }
+        },
+        {
+          "name": "POST Confirm Competitors - CANCEL (run_id=1)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"action\": \"cancel\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/competitors/confirm",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "competitors", "confirm"]
+            },
+            "description": "Reject competitors and cancel the run.\n\n**Change the '1' in URL to your run_id**"
+          }
+        },
+        {
+          "name": "GET Feasibility Check (run_id=1)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/feasibility",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "feasibility"]
+            },
+            "description": "Check if we have enough data to generate recommendations.\n\n**Change the '1' in URL to your run_id**\n\n**Response:**\n- is_feasible: true/false\n- warnings: Issues to be aware of\n- suggestions: Alternatives if not feasible"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Results (THE OUTPUT!)",
+      "item": [
+        {
+          "name": "GET Allocation Result (run_id=1)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/result",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "result"]
+            },
+            "description": "**THE MAIN OUTPUT!**\n\nGet the budget allocation recommendation.\n\n**Change the '1' in URL to your run_id**\n\n**Response includes:**\n- allocations: Channel breakdown (TV 37%, Online 28%, etc.)\n- total_budget_eur: Total budget\n- reasoning_summary: Why this allocation\n- confidence_score: How confident the AI is"
+          }
+        },
+        {
+          "name": "GET Chat / Feedback Cards (run_id=1)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/chat",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "chat"]
+            },
+            "description": "Get feedback cards (warnings, alerts, recommendations).\n\n**Change the '1' in URL to your run_id**\n\n**Message Types:**\n- summary: General summary\n- warning (yellow): Something to note\n- alert (red): Important issue\n- recommendation: Suggestion"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Owner Only (Traces)",
+      "item": [
+        {
+          "name": "GET Trace - As USER (Should FAIL 403)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              },
+              {
+                "key": "X-User-Role",
+                "value": "user"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/trace",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "trace"]
+            },
+            "description": "**This should FAIL with 403!**\n\nRegular users cannot access prompt traces.\n\nExpected: {\"detail\": \"Owner access required\"}"
+          }
+        },
+        {
+          "name": "GET Trace - As OWNER (Should SUCCEED)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              },
+              {
+                "key": "X-User-Role",
+                "value": "owner"
+              }
+            ],
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/1/trace",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "1", "trace"]
+            },
+            "description": "**Owner only!**\n\nSee exactly what was sent to GPT-4o.\n\n**Change the '1' in URL to your run_id**\n\n**Response includes:**\n- prompt: What we sent to the AI\n- response: What the AI replied\n- tokens: Usage count\n- latency_ms: How long it took"
+          }
+        }
+      ]
+    }
+  ]
+}
