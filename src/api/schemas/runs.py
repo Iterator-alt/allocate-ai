@@ -66,6 +66,8 @@ class RunStatusResponse(BaseModel):
 
     id: int
     status: RunStatus
+    stage: Optional[str] = Field(None, description="Current processing stage (S1, S1.5, S2, S3, S4)")
+    progress_pct: Optional[int] = Field(None, ge=0, le=100, description="Progress percentage (0-100)")
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
@@ -94,3 +96,22 @@ class RunListResponse(BaseModel):
 
     runs: List[RunResponse]
     total: int
+
+
+class StartRunRequest(BaseModel):
+    """Request to start an existing run (Manager's Spec v2).
+
+    The run must already exist in DB (created by JS Backend).
+    This endpoint triggers Stage 1 (competitor matching) in background.
+    """
+
+    run_id: int = Field(..., description="ID of the existing run to start")
+    action: str = Field(..., pattern="^start$", description="Must be 'start'")
+
+
+class StartRunResponse(BaseModel):
+    """Response for starting a run (Manager's Spec v2)."""
+
+    run_id: int
+    status: str = Field(..., description="'started' or 'error'")
+    error_message: Optional[str] = None

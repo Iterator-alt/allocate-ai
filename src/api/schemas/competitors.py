@@ -20,6 +20,17 @@ class CompetitorBrand(BaseModel):
     match_confidence: Optional[float] = Field(None, ge=0, le=1, description="Brand mapping confidence")
 
 
+class BrandInfo(BaseModel):
+    """Information about the target brand."""
+
+    brand_label: Optional[str] = Field(None, description="YouGov brand label")
+    nielsen_brand: Optional[str] = Field(None, description="Nielsen brand name")
+    match_type: Optional[str] = Field(None, description="Match type (exact, fuzzy, proxy)")
+    confidence: Optional[float] = Field(None, ge=0, le=1, description="Match confidence score")
+    kpi_scores: Optional[Dict[str, Optional[float]]] = Field(None, description="KPI scores (adaware, aware, consider)")
+    total_spend_teuro: Optional[float] = Field(None, description="Total spend in thousands EUR")
+
+
 class CompetitorSetResponse(BaseModel):
     """Response containing matched competitors for a run."""
 
@@ -30,6 +41,7 @@ class CompetitorSetResponse(BaseModel):
     total_competitors: int
     competitors_with_full_data: int = Field(..., description="Count with both Nielsen and YouGov data")
     warnings: List[str] = Field(default_factory=list, description="Data coverage warnings")
+    brand_info: Optional[BrandInfo] = Field(None, description="Information about the target brand")
 
 
 class ConfirmCompetitorsRequest(BaseModel):
@@ -50,3 +62,19 @@ class ConfirmCompetitorsResponse(BaseModel):
     status: str
     confirmed_competitors: Optional[List[str]] = None
     message: str
+
+
+class ConfirmCompetitorsRequestV2(BaseModel):
+    """Request to confirm competitors (Manager's Spec v2 - run_id in body).
+
+    This version moves run_id from URL path to request body.
+    Action accepts both 'approve' and 'approved' for compatibility.
+    """
+
+    run_id: int = Field(..., description="ID of the run to confirm")
+    action: str = Field(
+        ...,
+        pattern="^(approve|approved|cancel)$",
+        description="Action: 'approve', 'approved', or 'cancel'"
+    )
+    reason: Optional[str] = Field(None, max_length=500, description="Optional reason for cancellation")

@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Allocate.AI API Collection",
-    "description": "Complete API collection for testing Allocate.AI backend\n\nBase URL: http://localhost:8002\nSession Token: my-test-session-123",
+    "description": "Complete API collection for testing Allocate.AI backend\n\nBase URL: http://localhost:8002\nSession Token: my-test-session-123\n\nFlow (Manager's Spec v2 - JS Backend creates run):\n1. POST /runs/start → starts existing run (created by JS Backend)\n2. Poll GET /status until \"awaiting_confirmation\"\n3. GET /competitors → review competitor list\n4. POST /runs/competitors/confirm → triggers Stage 2-4 (run_id in body)\n5. Poll GET /status until \"completed\"\n6. GET /result → allocation results",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -43,6 +43,34 @@
     {
       "name": "2. Run Management",
       "item": [
+        {
+          "name": "POST Start Existing Run (v2 - Manager Spec)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"run_id\": 1,\n  \"action\": \"start\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/start",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "start"]
+            },
+            "description": "**Manager's Spec v2**\n\nStart an existing run (created by JS Backend).\n\n**Change run_id in body to your actual run ID**\n\n**Response:**\n- run_id: The run ID\n- status: 'started' or 'error'\n- error_message: null or error details"
+          }
+        },
         {
           "name": "POST Create New Run",
           "request": {
@@ -164,6 +192,62 @@
     {
       "name": "3. Competitors",
       "item": [
+        {
+          "name": "POST Confirm Competitors v2 - APPROVE (Manager Spec)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"run_id\": 1,\n  \"action\": \"approved\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/competitors/confirm",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "competitors", "confirm"]
+            },
+            "description": "**Manager's Spec v2**\n\nApprove competitors with run_id in body (not URL).\n\n**Change run_id in body to your actual run ID**\n\nAccepts both 'approve' and 'approved' action values.\nUses all competitors from Stage 1 (no selected_competitors param)."
+          }
+        },
+        {
+          "name": "POST Confirm Competitors v2 - CANCEL (Manager Spec)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Session-Token",
+                "value": "my-test-session-123"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"run_id\": 1,\n  \"action\": \"cancel\",\n  \"reason\": \"Competitors not suitable\"\n}"
+            },
+            "url": {
+              "raw": "http://localhost:8002/api/v1/runs/competitors/confirm",
+              "protocol": "http",
+              "host": ["localhost"],
+              "port": "8002",
+              "path": ["api", "v1", "runs", "competitors", "confirm"]
+            },
+            "description": "**Manager's Spec v2**\n\nCancel the run with run_id in body (not URL).\n\n**Change run_id in body to your actual run ID**"
+          }
+        },
         {
           "name": "GET Competitors (run_id=1)",
           "request": {

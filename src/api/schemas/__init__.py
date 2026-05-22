@@ -15,12 +15,16 @@ from src.api.schemas.runs import (
     StopRunRequest,
     StopRunResponse,
     RunListResponse,
+    StartRunRequest,
+    StartRunResponse,
 )
 from src.api.schemas.competitors import (
     CompetitorBrand,
+    BrandInfo,
     CompetitorSetResponse,
     ConfirmCompetitorsRequest,
     ConfirmCompetitorsResponse,
+    ConfirmCompetitorsRequestV2,
 )
 from src.api.schemas.results import (
     ChannelAllocation,
@@ -57,11 +61,15 @@ __all__ = [
     "StopRunRequest",
     "StopRunResponse",
     "RunListResponse",
+    "StartRunRequest",
+    "StartRunResponse",
     # Competitors
     "CompetitorBrand",
+    "BrandInfo",
     "CompetitorSetResponse",
     "ConfirmCompetitorsRequest",
     "ConfirmCompetitorsResponse",
+    "ConfirmCompetitorsRequestV2",
     # Results
     "ChannelAllocation",
     "KPIProjection",
