@@ -103,7 +103,8 @@ async def run_stage1_background(run_id: int, db_url: str):
                 goal_direction=run.input_parameters.get("direction", "budget_to_impact") if run.input_parameters else "budget_to_impact",
             )
 
-            result = await orchestrator.process(user_input)
+            # Pass run_id for debug logging (enabled via STAGE1_DEBUG_MODE env var)
+            result = await orchestrator.process(user_input, run_id=str(run_id))
 
             if result.status == Stage1Status.COMPLETED:
                 # Store Stage 1 results in run
