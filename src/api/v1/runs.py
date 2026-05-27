@@ -294,11 +294,44 @@ async def run_full_pipeline_background(
             allocations = []
             channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
 
+            # Try to extract total budget from LLM response if not in inputs
+            total_budget = inputs.total_budget
+            if not total_budget:
+                # Check if LLM returned a total budget
+                llm_total = parsed_allocation.get("totalBudgetEur", parsed_allocation.get("total_budget_eur"))
+                if llm_total:
+                    total_budget = float(llm_total)
+
             for channel in channels_data:
+                # Get share percentage - handle various field names
+                share_pct = float(
+                    channel.get("percentage") or
+                    channel.get("share_pct") or
+                    channel.get("sharePct") or
+                    0
+                )
+
+                # Get budget amount - handle various field names from LLM
+                budget_value = (
+                    channel.get("amount") or
+                    channel.get("budget") or
+                    channel.get("budgetGrossEur") or  # camelCase from LLM
+                    channel.get("budget_gross_eur") or  # snake_case
+                    None
+                )
+
+                # If no explicit budget but we have total_budget and share_pct, calculate it
+                if budget_value:
+                    budget_gross_eur = float(budget_value)
+                elif total_budget and share_pct > 0:
+                    budget_gross_eur = round(total_budget * share_pct / 100, 2)
+                else:
+                    budget_gross_eur = None
+
                 allocations.append({
                     "channel": channel.get("name", channel.get("channel", "Unknown")),
-                    "share_pct": float(channel.get("percentage", channel.get("share_pct", 0))),
-                    "budget_gross_eur": float(channel.get("amount", channel.get("budget", 0))) if channel.get("amount") or channel.get("budget") else None,
+                    "share_pct": share_pct,
+                    "budget_gross_eur": budget_gross_eur,
                     "reasoning": channel.get("rationale", channel.get("reasoning", "")),
                 })
 
@@ -307,10 +340,16 @@ async def run_full_pipeline_background(
             # =================================================================
             await _update_ai_run_status(session, ai_run, "completing", stage="S4", progress_pct=90)
 
+            # Calculate total budget from allocations if not provided
+            if not total_budget:
+                budget_sum = sum(a["budget_gross_eur"] or 0 for a in allocations)
+                if budget_sum > 0:
+                    total_budget = budget_sum
+
             allocation_result = {
                 "run_id": external_run_id,
                 "allocations": allocations,
-                "total_budget_eur": inputs.total_budget,
+                "total_budget_eur": total_budget,
                 "kpi_projection": None,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
                 "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
