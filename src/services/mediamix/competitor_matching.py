@@ -270,8 +270,8 @@ class NielsenBrandResolutionService:
         data_months = 0
         if spend_data:
             for record in spend_data:
-                total_spend += record.spend_eur
-            data_months = len(set((r.year, r.month) for r in spend_data))
+                total_spend += Decimal(str(record.teuro or 0))
+            data_months = len(set((r.jahr, r.monat) for r in spend_data))
 
         return {
             "nielsen_brand": best_mapping.nielsen_brand,
