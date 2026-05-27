@@ -333,10 +333,8 @@ class DataFilteringService:
         top_channels = [ch for ch, _ in sorted_channels[:5]]
 
         # Get sector for KPI average
-        from src.repositories import IndustryMapRepository
-
-        industry_repo = IndustryMapRepository(self.session)
-        sector_label = await industry_repo.get_sector_label(wirtschaftsgruppe)
+        # PRISMA-ONLY MODE: Skip industry_map table lookup, use wirtschaftsgruppe as sector
+        sector_label = wirtschaftsgruppe  # Use industry name directly
 
         avg_kpi = None
         if sector_label:

@@ -3,20 +3,21 @@
 Tool 3: Trigger reruns with change validation.
 - Only allows rerun if pending changes exist
 - Handles STATE A (no results) and STATE B (results exist) differently
-- Creates new run with incremented version (v1, v2, v3...)
+- Resets ProjectVersionAiRun status and triggers pipeline
+
+PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun instead of Python Run table.
 """
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
 
-from sqlalchemy import select, func, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import BackgroundTasks
 
-from src.db.models import Run
-from src.db.models.run import RunStatus
+from src.db.models.prisma_tables import PrismaProjectVersionAiRun
 from src.config import get_settings
 from src.services.chat.tools.context_loader import ChatContext
 
@@ -32,7 +33,7 @@ class RerunResult:
     rerun_triggered: bool = False
     blocked_reason: Optional[str] = None
     new_run_id: Optional[int] = None
-    new_version_name: Optional[str] = None  # e.g., "v2", "v3"
+    new_version_name: Optional[str] = None
     changes_applied: Optional[List[Dict[str, Any]]] = None
 
 
@@ -48,10 +49,12 @@ class RerunTool:
     STATE B (results exist + has_pending_changes=True):
     - Trigger on explicit phrases: "rerun", "regenerate", "apply changes", "run again", "redo"
     - Shows summary of changes being applied
-    - Either creates new run or resets existing run based on config
+    - Resets ProjectVersionAiRun status and triggers pipeline
 
     STATE B (results exist + has_pending_changes=False):
     - Response: "No changes to apply. The current allocation is up to date."
+
+    PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun instead of Run table.
     """
 
     def __init__(
@@ -71,7 +74,7 @@ class RerunTool:
         """Execute a rerun request.
 
         Args:
-            run_id: Run to rerun
+            run_id: externalRunId from ProjectVersionAiRun
             context: Current chat context with pending changes
 
         Returns:
@@ -97,40 +100,17 @@ class RerunTool:
         # STATE B with pending changes - proceed with rerun
         changes_summary = self._build_changes_summary(context.pending_changes)
 
-        # Check config flag for rerun behavior
-        create_new_run = getattr(self.settings, 'chat_rerun_creates_new', True)
+        # Reset the ProjectVersionAiRun and trigger pipeline
+        await self._reset_and_trigger_pipeline(run_id, context.ai_run_id)
 
-        if create_new_run:
-            # Create a new run with updated inputs and incremented version
-            new_run, version_name = await self._create_new_run(run_id, context)
-            new_run_id = new_run.id
-
-            # Start processing in background if we have background_tasks
-            if self.background_tasks:
-                await self._trigger_background_processing(new_run_id)
-
-            return RerunResult(
-                success=True,
-                message=f"Applying changes: {changes_summary}\n\n⟳ Creating {version_name} with updated inputs...",
-                rerun_triggered=True,
-                new_run_id=new_run_id,
-                new_version_name=version_name,
-                changes_applied=context.pending_changes,
-            )
-        else:
-            # Reset existing run to PENDING
-            await self._reset_run(run_id)
-
-            # Start processing in background
-            if self.background_tasks:
-                await self._trigger_background_processing(run_id)
-
-            return RerunResult(
-                success=True,
-                message=f"Applying changes: {changes_summary}\n\n⟳ Running allocation with updated inputs...",
-                rerun_triggered=True,
-                changes_applied=context.pending_changes,
-            )
+        return RerunResult(
+            success=True,
+            message=f"Applying changes: {changes_summary}\n\n[Rerun] Running allocation with updated inputs...",
+            rerun_triggered=True,
+            new_run_id=run_id,  # Same run_id, just reset
+            new_version_name=context.version_name,
+            changes_applied=context.pending_changes,
+        )
 
     def _build_changes_summary(self, pending_changes: List[Dict[str, Any]]) -> str:
         """Build a human-readable summary of pending changes."""
@@ -151,7 +131,7 @@ class RerunTool:
                 field = change.get("field", "unknown")
                 new_val = change.get("new")
                 if field == "total_budget":
-                    summaries.append(f"budget updated to €{new_val:,.0f}" if isinstance(new_val, (int, float)) else f"budget updated")
+                    summaries.append(f"budget updated to EUR{new_val:,.0f}" if isinstance(new_val, (int, float)) else f"budget updated")
                 elif field == "channels":
                     action = change.get("action", "updated")
                     value = change.get("value", "")
@@ -166,117 +146,67 @@ class RerunTool:
 
         return ", ".join(summaries)
 
-    async def _create_new_run(
+    async def _reset_and_trigger_pipeline(
         self,
-        source_run_id: int,
-        context: ChatContext,
-    ) -> tuple[Run, str]:
-        """Create a new run with updated inputs from the source run.
+        run_id: int,
+        ai_run_id: str,
+    ) -> None:
+        """Reset ProjectVersionAiRun status and trigger the pipeline.
 
-        Returns:
-            Tuple of (new_run, version_name) e.g., (Run, "v2")
+        Args:
+            run_id: externalRunId
+            ai_run_id: Internal Prisma ID for ProjectVersionAiRun
         """
-        # Get the source run
-        query = select(Run).where(Run.id == source_run_id)
-        result = await self.session.execute(query)
-        source_run = result.scalar_one_or_none()
-
-        if not source_run:
-            raise ValueError(f"Source run {source_run_id} not found")
-
-        # Determine next version number for this project
-        next_version = await self._get_next_version_number(source_run.project_id)
-        version_name = f"v{next_version}"
-
-        # Copy and update input_parameters with version info
-        input_params = source_run.input_parameters.copy() if source_run.input_parameters else {}
-        input_params["version_name"] = version_name
-        input_params["version_number"] = next_version
-        input_params["source_run_id"] = source_run_id  # Track lineage
-
-        # Create new run with same base parameters
-        new_run = Run(
-            session_token=source_run.session_token,
-            user_id=source_run.user_id,
-            project_id=source_run.project_id,
-            project_version_id=source_run.project_version_id,
-            customer_name=source_run.customer_name,
-            industry=source_run.industry,
-            brand_kpi=source_run.brand_kpi,
-            total_budget=source_run.total_budget,
-            time_period_start=source_run.time_period_start,
-            time_period_end=source_run.time_period_end,
-            input_parameters=input_params,
-            status=RunStatus.PENDING.value,
-            confirmed_competitors=source_run.confirmed_competitors.copy() if source_run.confirmed_competitors else {},
+        # Get the AI run
+        query = select(PrismaProjectVersionAiRun).where(
+            PrismaProjectVersionAiRun.externalRunId == run_id
         )
+        result = await self.session.execute(query)
+        ai_run = result.scalar_one_or_none()
 
-        self.session.add(new_run)
+        if not ai_run:
+            raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
+
+        # Reset status to pending
+        ai_run.status = "pending"
+        ai_run.stage = None
+        ai_run.progressPct = 0
+        ai_run.errorMessage = None
+        ai_run.startedAt = None
+        ai_run.completedAt = None
+        ai_run.updatedAt = datetime.utcnow()
+
+        # Clear previous allocation result (keep competitors and chat)
+        ai_run.allocationResult = None
+
         await self.session.flush()
 
-        logger.info(f"Created new run {new_run.id} ({version_name}) from source run {source_run_id}")
-        return new_run, version_name
+        logger.info(f"Reset ProjectVersionAiRun {ai_run_id} (externalRunId={run_id}) to pending status")
 
-    async def _get_next_version_number(
+        # Trigger background processing
+        if self.background_tasks:
+            await self._trigger_background_processing(run_id, ai_run_id)
+
+    async def _trigger_background_processing(
         self,
-        project_id: Optional[int],
-    ) -> int:
-        """Get the next version number for a project.
+        run_id: int,
+        ai_run_id: str,
+    ) -> None:
+        """Trigger background processing for the run.
 
-        Finds the highest version_number in input_parameters for runs
-        in this project and returns +1.
-        """
-        if not project_id:
-            return 1
-
-        # Get all runs for this project
-        query = select(Run).where(Run.project_id == project_id)
-        result = await self.session.execute(query)
-        runs = result.scalars().all()
-
-        max_version = 0
-        for run in runs:
-            if run.input_parameters:
-                version = run.input_parameters.get("version_number", 0)
-                if isinstance(version, int) and version > max_version:
-                    max_version = version
-
-        # If no versions found, start at 1 (existing run becomes v1 implicitly)
-        # New run will be v2
-        return max(max_version + 1, 2) if max_version > 0 else 2
-
-    async def _reset_run(self, run_id: int) -> None:
-        """Reset a run to PENDING status for reprocessing."""
-        query = select(Run).where(Run.id == run_id)
-        result = await self.session.execute(query)
-        run = result.scalar_one_or_none()
-
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
-
-        run.status = RunStatus.PENDING.value
-        run.started_at = None
-        run.completed_at = None
-        run.error_message = None
-
-        await self.session.flush()
-        logger.info(f"Reset run {run_id} to PENDING status")
-
-    async def _trigger_background_processing(self, run_id: int) -> None:
-        """Trigger background processing for a run.
-
-        This imports and calls the background task from runs.py
+        Calls run_full_pipeline_background from runs.py.
         """
         if not self.background_tasks:
             logger.warning(f"No background_tasks available for run {run_id}")
             return
 
         # Import here to avoid circular imports
-        from src.api.v1.runs import run_stage1_background
+        from src.api.v1.runs import run_full_pipeline_background
 
         self.background_tasks.add_task(
-            run_stage1_background,
-            run_id=run_id,
+            run_full_pipeline_background,
+            external_run_id=run_id,
+            prisma_ai_run_id=ai_run_id,
             db_url=self.settings.database_url,
         )
-        logger.info(f"Triggered background processing for run {run_id}")
+        logger.info(f"Triggered background processing for externalRunId={run_id}")

@@ -15,7 +15,6 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories import (
-    IndustryMapRepository,
     NielsenRepository,
     YouGovRepository,
 )
@@ -70,7 +69,6 @@ class DataFeasibilityGuard:
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.industry_repo = IndustryMapRepository(session)
         self.nielsen_repo = NielsenRepository(session)
         self.yougov_repo = YouGovRepository(session)
 
@@ -137,21 +135,27 @@ class DataFeasibilityGuard:
         )
 
     async def _check_industry(self, industry: str) -> Optional[FeasibilityIssue]:
-        """Check if industry exists in mapping table."""
-        sector_label = await self.industry_repo.get_sector_label(industry)
+        """Check if industry exists in Nielsen data.
 
-        if sector_label:
-            return None
+        PRISMA-ONLY MODE: No industry_map table, check Nielsen directly.
+        """
+        # Get all industries from Nielsen
+        all_industries = await self.nielsen_repo.get_wirtschaftsgruppen()
+
+        # Check if industry exists (case-insensitive)
+        industry_lower = industry.lower()
+        for ind in all_industries:
+            if ind.lower() == industry_lower:
+                return None  # Found exact match
 
         # Find similar industries for suggestions
-        all_industries = await self.industry_repo.get_all_wirtschaftsgruppen()
         suggestions = self._find_similar_strings(industry, all_industries, limit=5)
 
         return FeasibilityIssue(
             field="industry",
             value=industry,
             issue_type="not_found",
-            message=f"Industry '{industry}' not found in mapping table",
+            message=f"Industry '{industry}' not found in Nielsen data",
             suggestions=suggestions,
             is_blocking=True,
         )

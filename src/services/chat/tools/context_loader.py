@@ -1,22 +1,24 @@
 """Context loader tool for chat agent.
 
 Tool 0: Loads full context on every message including:
-- Chat history (last 20 messages for PROJECT - shared across versions)
-- Current competitor set from run.confirmed_competitors
-- Campaign config from Run model
-- Last result summary from AllocationResult
+- Chat history (last 20 messages from chatSnapshot)
+- Current competitor set from ProjectVersionAiRun.confirmedCompetitors
+- Campaign config from ProjectVersion
+- Last result summary from ProjectVersionAiRun.allocationResult
 - Pending changes extracted from chat history extra_data
+
+PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun and PrismaProjectVersion
+instead of Python Run/AllocationResult/ChatHistory tables.
 """
 
 import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
-from sqlalchemy import select, desc, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Run, AllocationResult, ChatHistory
-from src.db.models.run import RunStatus
+from src.db.models.prisma_tables import PrismaProjectVersionAiRun, PrismaProjectVersion
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +27,13 @@ logger = logging.getLogger(__name__)
 class ChatContext:
     """Full context for chat agent processing."""
 
-    run_id: int
-    project_id: Optional[int]
+    run_id: int  # This is externalRunId
+    project_id: Optional[str]  # ProjectVersion.projectId (string in Prisma)
+    ai_run_id: str  # PrismaProjectVersionAiRun.id (internal Prisma ID)
     run_status: str
     has_results: bool
 
-    # Recent chat messages with their extra_data (shared across project versions)
+    # Recent chat messages with their extra_data
     recent_messages: List[Dict[str, Any]] = field(default_factory=list)
 
     # Current competitor set
@@ -46,7 +49,7 @@ class ChatContext:
     direction: Optional[str] = None
 
     # Version info
-    version_name: Optional[str] = None  # e.g., "v1", "v2", "v3"
+    version_name: Optional[str] = None
     version_number: int = 1
 
     # Last result summary
@@ -66,6 +69,8 @@ class ContextLoaderTool:
 
     This tool runs silently on every message to provide
     full context to the agent for decision making.
+
+    PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun and PrismaProjectVersion.
     """
 
     def __init__(self, session: AsyncSession):
@@ -74,151 +79,132 @@ class ContextLoaderTool:
     async def load(
         self,
         run_id: int,
-        project_id: Optional[int] = None,
+        project_id: Optional[str] = None,
     ) -> ChatContext:
         """Load full context for a run.
 
         Args:
-            run_id: The run ID to load context for
-            project_id: Optional project ID
+            run_id: The externalRunId from ProjectVersionAiRun
+            project_id: Optional project ID (not used in Prisma mode)
 
         Returns:
             ChatContext with all relevant state
         """
-        # Load run
-        run = await self._get_run(run_id)
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
+        # Load AI run by externalRunId
+        ai_run = await self._get_ai_run(run_id)
+        if not ai_run:
+            raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
 
-        # Determine project_id
-        effective_project_id = project_id or run.project_id
+        # Load ProjectVersion for campaign inputs
+        project_version = await self._get_project_version(ai_run.projectVersionId)
+        if not project_version:
+            raise ValueError(f"ProjectVersion {ai_run.projectVersionId} not found")
 
-        # Load allocation result if exists
-        result = await self._get_allocation_result(run_id)
+        # Check if results exist
+        has_results = ai_run.allocationResult is not None and ai_run.status == "completed"
 
-        # Load recent chat messages - SHARED ACROSS PROJECT VERSIONS
-        if effective_project_id:
-            messages = await self._get_project_messages(effective_project_id, limit=20)
-        else:
-            # Fallback to run-specific if no project
-            messages = await self._get_recent_messages(run_id, limit=20)
+        # Get result summary if available
+        result_summary = None
+        if ai_run.allocationResult:
+            result_summary = ai_run.allocationResult.get("reasoning_summary")
+
+        # Load chat messages from chatSnapshot
+        messages = self._get_messages_from_snapshot(ai_run.chatSnapshot)
 
         # Extract pending changes from messages
         pending_changes = self._extract_pending_changes(messages)
 
-        # Extract current competitors from run.confirmed_competitors
-        competitors = self._extract_competitors(run.confirmed_competitors)
+        # Extract current competitors from confirmedCompetitors array
+        competitors = list(ai_run.confirmedCompetitors) if ai_run.confirmedCompetitors else []
 
-        # Extract campaign config from run
-        channels = []
-        goal_text = None
-        direction = None
-        version_name = None
-        version_number = 1
-        if run.input_parameters:
-            channels = run.input_parameters.get("channels", []) or []
-            goal_text = run.input_parameters.get("goal_text")
-            direction = run.input_parameters.get("direction")
-            version_name = run.input_parameters.get("version_name")
-            version_number = run.input_parameters.get("version_number", 1)
+        # Check rawPayload for any edits made via chat
+        raw_payload = ai_run.rawPayload or {}
+        chat_edits = raw_payload.get("chat_edits", {})
+
+        # Get channels from ProjectVersion or chat edits
+        channels = list(project_version.mediaChannels) if project_version.mediaChannels else []
+        if "channels" in chat_edits:
+            channels = chat_edits["channels"]
+
+        # Get total_budget from chat edits or extract from goalText
+        total_budget = chat_edits.get("total_budget")
+        if total_budget is None:
+            total_budget = self._extract_budget_from_goal_text(project_version.goalText)
+
+        # Get direction from chat edits or derive from goalMode
+        direction = chat_edits.get("direction")
+        if direction is None:
+            direction = "increase" if project_version.goalMode == "goal" else "budget_to_impact"
+
+        # Get brand_kpi from chat edits or ProjectVersion
+        brand_kpi = chat_edits.get("brand_kpi", project_version.brandKpi)
+
+        # Get goal_text from chat edits or ProjectVersion
+        goal_text = chat_edits.get("goal_text", project_version.goalText)
 
         return ChatContext(
             run_id=run_id,
-            project_id=effective_project_id,
-            run_status=run.status,
-            has_results=result is not None,
+            project_id=project_version.projectId,
+            ai_run_id=ai_run.id,
+            run_status=ai_run.status,
+            has_results=has_results,
             recent_messages=messages,
             current_competitors=competitors,
-            customer_name=run.customer_name,
-            industry=run.industry,
-            brand_kpi=run.brand_kpi,
-            total_budget=float(run.total_budget) if run.total_budget else None,
+            customer_name=project_version.customer,
+            industry=project_version.industry,
+            brand_kpi=brand_kpi,
+            total_budget=total_budget,
             channels=channels,
             goal_text=goal_text,
             direction=direction,
-            version_name=version_name,
-            version_number=version_number,
-            last_result_summary=result.summary if result else None,
+            version_name=project_version.versionName,
+            version_number=project_version.versionNumber,
+            last_result_summary=result_summary,
             pending_changes=pending_changes,
         )
 
-    async def _get_run(self, run_id: int) -> Optional[Run]:
-        """Get run by ID."""
-        query = select(Run).where(Run.id == run_id)
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-
-    async def _get_allocation_result(self, run_id: int) -> Optional[AllocationResult]:
-        """Get allocation result for a run."""
-        query = select(AllocationResult).where(AllocationResult.run_id == run_id)
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
-
-    async def _get_recent_messages(
-        self,
-        run_id: int,
-        limit: int = 20,
-    ) -> List[Dict[str, Any]]:
-        """Get recent chat messages with their extra_data for a single run."""
-        query = (
-            select(ChatHistory)
-            .where(ChatHistory.run_id == run_id)
-            .order_by(desc(ChatHistory.created_at))
-            .limit(limit)
+    async def _get_ai_run(self, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
+        """Get ProjectVersionAiRun by externalRunId."""
+        query = select(PrismaProjectVersionAiRun).where(
+            PrismaProjectVersionAiRun.externalRunId == external_run_id
         )
         result = await self.session.execute(query)
-        rows = result.scalars().all()
+        return result.scalar_one_or_none()
 
-        return self._format_messages(rows)
+    async def _get_project_version(self, project_version_id: str) -> Optional[PrismaProjectVersion]:
+        """Get ProjectVersion by ID."""
+        query = select(PrismaProjectVersion).where(
+            PrismaProjectVersion.id == project_version_id
+        )
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
 
-    async def _get_project_messages(
+    def _get_messages_from_snapshot(
         self,
-        project_id: int,
-        limit: int = 20,
+        chat_snapshot: Optional[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Get recent chat messages across ALL runs in a project.
+        """Extract messages from chatSnapshot JSON.
 
-        This enables chat history to be shared across version tabs.
+        chatSnapshot structure:
+        {
+            "messages": [
+                {
+                    "id": 1,
+                    "role": "user",
+                    "content": "...",
+                    "tool_used": null,
+                    "changes_made": [],
+                    "created_at": "..."
+                },
+                ...
+            ]
+        }
         """
-        # Join ChatHistory with Run to filter by project_id
-        query = (
-            select(ChatHistory)
-            .join(Run, ChatHistory.run_id == Run.id)
-            .where(Run.project_id == project_id)
-            .order_by(desc(ChatHistory.created_at))
-            .limit(limit)
-        )
-        result = await self.session.execute(query)
-        rows = result.scalars().all()
+        if not chat_snapshot:
+            return []
 
-        return self._format_messages(rows)
-
-    def _format_messages(self, rows: List[ChatHistory]) -> List[Dict[str, Any]]:
-        """Format ChatHistory rows into message dicts."""
-        messages = []
-        for row in reversed(rows):  # Reverse to get chronological order
-            msg = {
-                "id": row.id,
-                "run_id": row.run_id,  # Include run_id for context
-                "message_type": row.message_type,
-                "title": row.title,
-                "content": row.content,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-
-            # Parse extra_data for chat agent fields
-            if row.extra_data:
-                msg["role"] = row.extra_data.get("role", "system")
-                msg["tool_used"] = row.extra_data.get("tool_used")
-                msg["changes_made"] = row.extra_data.get("changes_made", [])
-            else:
-                msg["role"] = "system"
-                msg["tool_used"] = None
-                msg["changes_made"] = []
-
-            messages.append(msg)
-
-        return messages
+        messages = chat_snapshot.get("messages", [])
+        return messages[-20:]  # Return last 20 messages
 
     def _extract_pending_changes(
         self,
@@ -252,30 +238,42 @@ class ContextLoaderTool:
 
         return pending_changes
 
-    def _extract_competitors(
-        self,
-        confirmed_competitors: Optional[Dict[str, Any]],
-    ) -> List[str]:
-        """Extract competitor list from confirmed_competitors JSON.
+    def _extract_budget_from_goal_text(self, goal_text: str) -> Optional[float]:
+        """Extract budget amount from goal_text using regex.
 
-        Priority order:
-        1. "brands" - set by chat agent updates
-        2. "confirmed_brands" - set when user confirms selected competitors
-        3. "stage1_result.competitors" - original Stage 1 suggestions (fallback)
+        Supports formats like:
+        - "€2M budget" -> 2000000
+        - "2M EUR" -> 2000000
+        - "€500K" -> 500000
+        - "500000 euros" -> 500000
         """
-        if not confirmed_competitors:
-            return []
+        import re
 
-        # Priority 1: Check for brands list (set by chat agent)
-        if "brands" in confirmed_competitors:
-            return confirmed_competitors["brands"]
+        if not goal_text:
+            return None
 
-        # Priority 2: Check for confirmed_brands (set at confirmation step)
-        if "confirmed_brands" in confirmed_competitors:
-            return confirmed_competitors["confirmed_brands"]
+        # Normalize text
+        text = goal_text.lower().replace(",", "").replace(" ", "")
 
-        # Priority 3: Fallback to stage1_result.competitors (original suggestions)
-        stage1_result = confirmed_competitors.get("stage1_result", {})
-        competitors = stage1_result.get("competitors", [])
+        # Pattern 1: €2M, €500K, 2M€, etc.
+        pattern_m = r'[€$]?(\d+(?:\.\d+)?)\s*m(?:illion)?|(\d+(?:\.\d+)?)\s*m(?:illion)?\s*[€$]?'
+        match = re.search(pattern_m, text, re.IGNORECASE)
+        if match:
+            value = float(match.group(1) or match.group(2))
+            return value * 1_000_000
 
-        return [c.get("brand_label", "") for c in competitors if c.get("brand_label")]
+        # Pattern 2: €500K, 500K€, etc.
+        pattern_k = r'[€$]?(\d+(?:\.\d+)?)\s*k|(\d+(?:\.\d+)?)\s*k\s*[€$]?'
+        match = re.search(pattern_k, text, re.IGNORECASE)
+        if match:
+            value = float(match.group(1) or match.group(2))
+            return value * 1_000
+
+        # Pattern 3: Plain numbers with currency indicators
+        pattern_plain = r'[€$]?\s*(\d{5,})\s*(?:eur(?:o)?s?)?|budget\s*(?:of)?\s*[€$]?\s*(\d{5,})'
+        match = re.search(pattern_plain, text, re.IGNORECASE)
+        if match:
+            value = match.group(1) or match.group(2)
+            return float(value)
+
+        return None

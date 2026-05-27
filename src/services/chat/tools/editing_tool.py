@@ -6,17 +6,21 @@ Tool 2: Edit campaign inputs including:
 - goal_text: Goal description
 - brand_kpi: adaware/aided/consider
 - direction: increase/maintain/decrease
+
+PRISMA-ONLY MODE: Stores edits in ProjectVersionAiRun.rawPayload
+since ProjectVersion is READ-ONLY from Python.
 """
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional, Dict, Any, Union
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Run
+from src.db.models.prisma_tables import PrismaProjectVersionAiRun
 from src.services.chat.tools.context_loader import ChatContext
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,9 @@ class InteractiveEditingTool:
     - goal_text: Goal description
     - brand_kpi: adaware/aided/consider
     - direction: increase/maintain/decrease
+
+    PRISMA-ONLY MODE: Stores edits in ProjectVersionAiRun.rawPayload["chat_edits"]
+    since ProjectVersion is READ-ONLY from Python.
     """
 
     def __init__(self, session: AsyncSession):
@@ -66,7 +73,7 @@ class InteractiveEditingTool:
         """Edit a campaign field.
 
         Args:
-            run_id: Run to update
+            run_id: externalRunId from ProjectVersionAiRun
             field: Field name to edit
             value: New value
             context: Current chat context
@@ -140,7 +147,7 @@ class InteractiveEditingTool:
             )
 
         old_value = context.total_budget
-        await self._update_run_field(run_id, "total_budget", Decimal(str(budget)))
+        await self._update_chat_edit(run_id, "total_budget", budget)
 
         change_record = {
             "type": "edit",
@@ -187,7 +194,7 @@ class InteractiveEditingTool:
                 new_channels = list(value)
 
             old_value = current_channels
-            await self._update_run_input_parameter(run_id, "channels", new_channels)
+            await self._update_chat_edit(run_id, "channels", new_channels)
 
             change_record = {
                 "type": "edit",
@@ -216,7 +223,7 @@ class InteractiveEditingTool:
                 )
 
             new_channels = current_channels + [channel]
-            await self._update_run_input_parameter(run_id, "channels", new_channels)
+            await self._update_chat_edit(run_id, "channels", new_channels)
 
             change_record = {
                 "type": "edit",
@@ -248,7 +255,7 @@ class InteractiveEditingTool:
                 )
 
             new_channels = [c for c in current_channels if c.lower() != channel.lower()]
-            await self._update_run_input_parameter(run_id, "channels", new_channels)
+            await self._update_chat_edit(run_id, "channels", new_channels)
 
             change_record = {
                 "type": "edit",
@@ -291,7 +298,7 @@ class InteractiveEditingTool:
             )
 
         old_value = context.goal_text
-        await self._update_run_input_parameter(run_id, "goal_text", goal_text)
+        await self._update_chat_edit(run_id, "goal_text", goal_text)
 
         change_record = {
             "type": "edit",
@@ -326,7 +333,7 @@ class InteractiveEditingTool:
             )
 
         old_value = context.brand_kpi
-        await self._update_run_field(run_id, "brand_kpi", kpi)
+        await self._update_chat_edit(run_id, "brand_kpi", kpi)
 
         change_record = {
             "type": "edit",
@@ -361,7 +368,7 @@ class InteractiveEditingTool:
             )
 
         old_value = context.direction
-        await self._update_run_input_parameter(run_id, "direction", direction)
+        await self._update_chat_edit(run_id, "direction", direction)
 
         change_record = {
             "type": "edit",
@@ -379,38 +386,39 @@ class InteractiveEditingTool:
             change_record=change_record,
         )
 
-    async def _update_run_field(
+    async def _update_chat_edit(
         self,
         run_id: int,
         field: str,
         value: Any,
     ) -> None:
-        """Update a direct field on the Run model."""
-        query = select(Run).where(Run.id == run_id)
+        """Update a field in ProjectVersionAiRun.rawPayload["chat_edits"].
+
+        Since ProjectVersion is READ-ONLY from Python, we store edits
+        in rawPayload and the context_loader reads from there.
+        """
+        query = select(PrismaProjectVersionAiRun).where(
+            PrismaProjectVersionAiRun.externalRunId == run_id
+        )
         result = await self.session.execute(query)
-        run = result.scalar_one_or_none()
+        ai_run = result.scalar_one_or_none()
 
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
+        if not ai_run:
+            raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
 
-        setattr(run, field, value)
-        await self.session.flush()
+        # Get or initialize rawPayload
+        raw_payload = ai_run.rawPayload or {}
 
-    async def _update_run_input_parameter(
-        self,
-        run_id: int,
-        key: str,
-        value: Any,
-    ) -> None:
-        """Update a field in run.input_parameters JSON."""
-        query = select(Run).where(Run.id == run_id)
-        result = await self.session.execute(query)
-        run = result.scalar_one_or_none()
+        # Get or initialize chat_edits
+        chat_edits = raw_payload.get("chat_edits", {})
 
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
+        # Update the field
+        chat_edits[field] = value
+        chat_edits["updated_at"] = datetime.utcnow().isoformat()
 
-        params = run.input_parameters or {}
-        params[key] = value
-        run.input_parameters = params
+        # Store back
+        raw_payload["chat_edits"] = chat_edits
+        ai_run.rawPayload = raw_payload
+        ai_run.updatedAt = datetime.utcnow()
+
         await self.session.flush()

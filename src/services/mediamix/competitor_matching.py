@@ -23,8 +23,6 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories import (
-    IndustryMapRepository,
-    BrandMapRepository,
     NielsenRepository,
     YouGovRepository,
 )
@@ -76,26 +74,28 @@ class IndustryLookupService:
     """Service for industry classification lookup.
 
     Maps Nielsen Wirtschaftsgruppe to YouGov sector_label.
+
+    PRISMA-ONLY MODE: The industry_map table doesn't exist.
+    Returns the wirtschaftsgruppe as-is for sector lookups.
     """
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.industry_repo = IndustryMapRepository(session)
+        self.nielsen_repo = NielsenRepository(session)
 
     async def lookup_sector(self, wirtschaftsgruppe: str) -> Optional[str]:
         """Look up the YouGov sector label for a Wirtschaftsgruppe.
 
-        Args:
-            wirtschaftsgruppe: Nielsen industry classification
-
-        Returns:
-            YouGov sector_label or None if not found
+        PRISMA-ONLY MODE: Returns wirtschaftsgruppe as-is (no mapping table).
         """
-        return await self.industry_repo.get_sector_label(wirtschaftsgruppe)
+        return wirtschaftsgruppe
 
     async def get_all_industries(self) -> List[str]:
-        """Get all available Wirtschaftsgruppen with mappings."""
-        return await self.industry_repo.get_all_wirtschaftsgruppen()
+        """Get all available Wirtschaftsgruppen.
+
+        PRISMA-ONLY MODE: Gets from Nielsen table directly.
+        """
+        return await self.nielsen_repo.get_wirtschaftsgruppen()
 
     async def find_similar_industries(
         self, wirtschaftsgruppe: str, limit: int = 5
@@ -103,7 +103,6 @@ class IndustryLookupService:
         """Find similar industry names for suggestions.
 
         Uses simple substring matching for MVP.
-        More sophisticated fuzzy matching can be added later.
         """
         all_industries = await self.get_all_industries()
 
