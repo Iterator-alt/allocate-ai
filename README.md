@@ -36,9 +36,10 @@ alembic upgrade head
 
 ### 5. Start Server
 ```bash
-uvicorn src.main:app --host 0.0.0.0 --port 8002
+nohup uvicorn src.main:app --host 0.0.0.0 --port 8003 --workers 1 > uvicorn.log 2>&1 &
 ```
-
+lsof -ti:8003
+kill <pid>
 Server runs at: http://localhost:8002
 
 ---
