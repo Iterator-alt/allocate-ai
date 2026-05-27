@@ -316,13 +316,15 @@ class DataFilteringService:
         if not industry_data:
             return None
 
-        # Aggregate spend by channel
+        # Aggregate spend by channel (mediengruppe)
         channel_totals: Dict[str, Decimal] = {}
         for record in industry_data:
-            channel = record.channel
+            channel = record.mediengruppe
+            if not channel:
+                continue
             if channel not in channel_totals:
                 channel_totals[channel] = Decimal("0")
-            channel_totals[channel] += record.spend_eur
+            channel_totals[channel] += Decimal(str(record.teuro or 0))
 
         # Sort channels by total spend
         sorted_channels = sorted(
