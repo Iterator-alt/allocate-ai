@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     # Cache
     result_cache_ttl_seconds: int = 3600
 
+    # Chat Agent Configuration
+    chat_rerun_creates_new: bool = True  # True=create new run on rerun, False=update existing
+
+    # Competitor Confirmation Bypass
+    # When True, auto-approve all competitors after Stage 1 and proceed directly to Stage 2
+    # When False, wait for user to confirm competitors via POST /runs/competitors/confirm
+    bypass_competitor_confirmation: bool = True
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

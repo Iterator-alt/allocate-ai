@@ -101,11 +101,12 @@ class RunListResponse(BaseModel):
 class StartRunRequest(BaseModel):
     """Request to start an existing run (Manager's Spec v2).
 
-    The run must already exist in DB (created by JS Backend).
-    This endpoint triggers Stage 1 (competitor matching) in background.
+    The run_id here is the externalRunId from ProjectVersionAiRun.
+    This endpoint looks up the ProjectVersion, creates an internal Run,
+    and triggers Stage 1 (competitor matching) in background.
     """
 
-    run_id: int = Field(..., description="ID of the existing run to start")
+    run_id: int = Field(..., description="The externalRunId from ProjectVersionAiRun")
     action: str = Field(..., pattern="^start$", description="Must be 'start'")
 
 

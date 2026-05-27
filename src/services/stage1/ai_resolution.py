@@ -166,10 +166,12 @@ class AIResolutionService:
 Map the user's industry input to the best matching values from the provided YouGov and Nielsen sector lists.
 
 Rules:
-1. Handle semantic equivalences (e.g., "Food II", "Food III" may both apply to food industry)
-2. Match based on meaning, not exact string match
-3. If multiple sectors apply, include all of them
-4. If no good match exists, return empty lists
+1. ALWAYS include ALL semantically related sectors, not just exact matches
+2. "Lebensmittel" (German for food) should match ALL food sectors: "Food I", "Food II", "Food III", "Lebensmittel I", etc.
+3. If user specifies "Lebensmittel I", still include "Food II" and other food-related sectors
+4. Handle German/English equivalences: Lebensmittel=Food, Getränke=Beverages, etc.
+5. When in doubt, be INCLUSIVE - include more sectors rather than fewer
+6. If no good match exists, return empty lists
 
 Return ONLY valid JSON in this format:
 {"yougov_sectors": ["sector1", "sector2"], "nielsen_sectors": ["sector1"], "confidence": 0.95, "reasoning": "brief explanation"}"""

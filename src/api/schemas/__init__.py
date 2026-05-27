@@ -45,6 +45,14 @@ from src.api.schemas.traces import (
     PromptTraceSummary,
     UsageStats,
 )
+from src.api.schemas.chat_agent import (
+    ToolType,
+    ChatMessageRequest,
+    ChatMessageResponse,
+    PendingChange,
+    IntentEntity,
+    IntentClassificationResult as IntentClassificationResultSchema,
+)
 
 __all__ = [
     # Common
@@ -86,4 +94,11 @@ __all__ = [
     "PromptTraceListResponse",
     "PromptTraceSummary",
     "UsageStats",
+    # Chat Agent
+    "ToolType",
+    "ChatMessageRequest",
+    "ChatMessageResponse",
+    "PendingChange",
+    "IntentEntity",
+    "IntentClassificationResultSchema",
 ]

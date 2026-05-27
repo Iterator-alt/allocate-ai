@@ -420,3 +420,110 @@ class ChatHistoryRepository(BaseRepository[ChatHistory]):
         )
         result = await self.session.execute(query)
         return result.scalar_one()
+
+    async def get_chat_messages(
+        self,
+        run_id: int,
+        limit: int = 20,
+        include_system: bool = True,
+    ) -> List[ChatHistory]:
+        """Get recent chat messages for a run.
+
+        Used by chat agent to load conversation context.
+
+        Args:
+            run_id: Run ID to get messages for
+            limit: Maximum number of messages to return
+            include_system: Whether to include system messages
+
+        Returns:
+            List of ChatHistory messages, most recent first
+        """
+        query = select(ChatHistory).where(ChatHistory.run_id == run_id)
+
+        if not include_system:
+            # Only include chat messages (not system feedback cards)
+            query = query.where(ChatHistory.message_type == "chat")
+
+        query = query.order_by(ChatHistory.created_at.desc()).limit(limit)
+
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
+
+    async def add_chat_message(
+        self,
+        run_id: int,
+        role: str,
+        content: str,
+        tool_used: Optional[str] = None,
+        changes_made: Optional[List[Dict[str, Any]]] = None,
+    ) -> ChatHistory:
+        """Add a chat message with agent-specific extra_data.
+
+        Args:
+            run_id: Run ID
+            role: "user", "agent", or "system"
+            content: Message content
+            tool_used: Tool that was used (if any)
+            changes_made: List of changes made by this message
+
+        Returns:
+            Created ChatHistory instance
+        """
+        count = await self._get_message_count(run_id)
+
+        extra_data = {
+            "role": role,
+            "tool_used": tool_used,
+            "changes_made": changes_made or [],
+        }
+
+        title = "User" if role == "user" else "Agent" if role == "agent" else "System"
+
+        return await self.create_message(
+            run_id=run_id,
+            message_type="chat",
+            severity="info",
+            title=title,
+            content=content,
+            extra_data=extra_data,
+            display_order=count,
+        )
+
+    async def get_pending_changes(
+        self,
+        run_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Get pending changes since the last rerun.
+
+        Scans chat history for changes_made in extra_data,
+        resets when a "rerun" tool is seen.
+
+        Returns:
+            List of pending change records
+        """
+        messages = await self.get_chat_messages(run_id, limit=50)
+
+        # Process in chronological order (oldest first)
+        messages.reverse()
+
+        pending_changes: List[Dict[str, Any]] = []
+
+        for msg in messages:
+            if not msg.extra_data:
+                continue
+
+            tool_used = msg.extra_data.get("tool_used")
+
+            # Reset on rerun
+            if tool_used == "rerun":
+                pending_changes = []
+                continue
+
+            # Accumulate changes
+            changes_made = msg.extra_data.get("changes_made", [])
+            for change in changes_made:
+                if change.get("type") != "rerun":
+                    pending_changes.append(change)
+
+        return pending_changes

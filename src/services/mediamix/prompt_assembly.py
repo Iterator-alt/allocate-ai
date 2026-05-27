@@ -173,34 +173,22 @@ Provide your recommendation in the following JSON format:
         )
 
     async def _get_expert_knowledge(self) -> str:
-        """Load and combine all active expert knowledge."""
-        knowledge_records = await self.knowledge_repo.get_all_active()
+        """Load and combine all active expert knowledge.
 
-        if not knowledge_records:
-            return self._get_default_expert_knowledge()
-
-        sections = []
-        for record in knowledge_records:
-            sections.append(f"### {record.category.replace('_', ' ').title()}")
-            sections.append(record.content)
-            sections.append("")
-
-        return "\n".join(sections)
+        In Prisma-only mode (no Python tables), always returns defaults.
+        """
+        # Skip database query entirely - use defaults
+        # The expert_knowledge table doesn't exist in Prisma-only mode
+        return self._get_default_expert_knowledge()
 
     async def _get_guardrails(self) -> str:
-        """Load and combine all active guardrails."""
-        guardrail_records = await self.guardrails_repo.get_all_active()
+        """Load and combine all active guardrails.
 
-        if not guardrail_records:
-            return self._get_default_guardrails()
-
-        sections = []
-        for record in guardrail_records:
-            sections.append(f"### {record.guardrail_type.replace('_', ' ').title()}")
-            sections.append(record.content)
-            sections.append("")
-
-        return "\n".join(sections)
+        In Prisma-only mode (no Python tables), always returns defaults.
+        """
+        # Skip database query entirely - use defaults
+        # The prompt_guardrails table doesn't exist in Prisma-only mode
+        return self._get_default_guardrails()
 
     def _build_user_prompt(
         self,

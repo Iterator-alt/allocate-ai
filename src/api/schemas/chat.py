@@ -17,6 +17,7 @@ class MessageType(str, Enum):
     SUMMARY = "summary"
     RECOMMENDATION = "recommendation"
     INFO = "info"
+    CHAT = "chat"  # Interactive chat messages from chat agent
 
 
 class Severity(str, Enum):

@@ -110,9 +110,11 @@ async def readiness_check(db: AsyncSession = Depends(get_db)):
 
 
 # Import and include API routers
-from src.api.v1 import runs, competitors, results, traces
+from src.api.v1 import runs, competitors, results, traces, stage1, chat
 
 app.include_router(runs.router, prefix="/api/v1")
 app.include_router(competitors.router, prefix="/api/v1")
 app.include_router(results.router, prefix="/api/v1")
 app.include_router(traces.router, prefix="/api/v1")
+app.include_router(stage1.router, prefix="/api/v1")
+app.include_router(chat.router, prefix="/api/v1")

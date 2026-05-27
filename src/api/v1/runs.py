@@ -1,36 +1,34 @@
-"""Run management API endpoints.
+"""Run management API endpoints - Prisma-only version.
 
 Endpoints:
-- POST /runs - Create a new generation run (auto-triggers Stage 1)
-- GET /runs/{id}/status - Poll run state
-- POST /runs/{id}/stop - Cancel in-flight or queued run
+- POST /runs - Start a new generation run (accepts {run_id, action: "start"})
+- GET /runs/{id}/status - Poll run state from ProjectVersionAiRun
+- GET /runs/{id}/result - Get allocation result from ProjectVersionAiRun
 
 Flow:
-1. POST /runs → creates run, auto-triggers Stage 1 (competitor matching)
-2. Poll status until "awaiting_confirmation"
-3. GET /competitors → review competitor list
-4. POST /competitors/confirm → triggers Stage 2-4 (AI generation)
-5. Poll status until "completed"
-6. GET /result → allocation results
-7. GET /chat → feedback cards
+1. POST /runs with {run_id, action: "start"} where run_id = externalRunId from ProjectVersionAiRun
+2. Python reads inputs from ProjectVersion, runs Stage 1-4 pipeline
+3. Results are stored in ProjectVersionAiRun.allocationResult
+4. Poll status until "completed", then GET /result
+
+NO PYTHON TABLES REQUIRED - all state is stored in Prisma tables.
 """
 
 import logging
-import asyncio
-from datetime import datetime, timezone
-from typing import Optional
+import re
+import json
+from datetime import datetime
+from typing import Optional, List
 from decimal import Decimal
+from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.dependencies import get_db
 from src.api.schemas import (
-    CreateRunRequest,
-    RunResponse,
     RunStatusResponse,
-    StopRunRequest,
-    StopRunResponse,
     RunStatus,
     ErrorResponse,
     StartRunRequest,
@@ -41,8 +39,7 @@ from src.api.middleware import (
     SessionContext,
     limiter,
 )
-from src.repositories import RunRepository
-from src.db.models.run import RunStatus as DBRunStatus, AllocationResult, ChatHistory
+from src.db.models.prisma_tables import PrismaProjectVersion, PrismaProjectVersionAiRun
 
 # Stage 1 imports
 from src.services.stage1 import (
@@ -54,10 +51,7 @@ from src.services.stage1 import (
 
 # Stage 2-4 AI Pipeline imports
 from src.services.llm_gateway.client import OpenAIClient
-from src.services.llm_gateway.trace_logger import PromptTraceLogger
 from src.services.mediamix.prompt_assembly import PromptAssemblyService, PromptAssemblyInput
-from src.services.mediamix.output_parsing import OutputParsingService
-from src.services.mediamix.feedback_generation import FeedbackGenerationService
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +59,119 @@ router = APIRouter(prefix="/runs", tags=["runs"])
 
 
 # =============================================================================
-# Background Task: Stage 1 Processing
+# Data Classes for In-Memory State
 # =============================================================================
 
-async def run_stage1_background(run_id: int, db_url: str):
-    """Background task to run Stage 1 (competitor matching).
+@dataclass
+class CampaignInputs:
+    """Campaign inputs extracted from ProjectVersion."""
+    customer_name: str
+    industry: str
+    brand_kpi: str
+    media_channels: List[str]
+    goal_mode: str
+    goal_text: str
+    total_budget: Optional[float]
+    direction: str
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def extract_budget_from_goal_text(goal_text: str) -> Optional[float]:
+    """Extract budget amount from goal_text using regex.
+
+    Supports formats like:
+    - "€2M budget" -> 2000000
+    - "2M EUR" -> 2000000
+    - "€500K" -> 500000
+    - "500000 euros" -> 500000
+    - "budget of 1,000,000" -> 1000000
+    """
+    if not goal_text:
+        return None
+
+    # Normalize text
+    text = goal_text.lower().replace(",", "").replace(" ", "")
+
+    # Pattern 1: €2M, €500K, 2M€, etc.
+    pattern_m = r'[€$]?(\d+(?:\.\d+)?)\s*m(?:illion)?|(\d+(?:\.\d+)?)\s*m(?:illion)?\s*[€$]?'
+    match = re.search(pattern_m, text, re.IGNORECASE)
+    if match:
+        value = float(match.group(1) or match.group(2))
+        return value * 1_000_000
+
+    # Pattern 2: €500K, 500K€, etc.
+    pattern_k = r'[€$]?(\d+(?:\.\d+)?)\s*k|(\d+(?:\.\d+)?)\s*k\s*[€$]?'
+    match = re.search(pattern_k, text, re.IGNORECASE)
+    if match:
+        value = float(match.group(1) or match.group(2))
+        return value * 1_000
+
+    # Pattern 3: Plain numbers with currency indicators
+    pattern_plain = r'[€$]?\s*(\d{5,})\s*(?:eur(?:o)?s?)?|budget\s*(?:of)?\s*[€$]?\s*(\d{5,})'
+    match = re.search(pattern_plain, text, re.IGNORECASE)
+    if match:
+        value = match.group(1) or match.group(2)
+        return float(value)
+
+    return None
+
+
+def map_goal_mode_to_direction(goal_mode: str) -> str:
+    """Map Prisma goalMode to our direction format."""
+    return "increase" if goal_mode == "goal" else "budget_to_impact"
+
+
+async def get_ai_run_by_external_id(db: AsyncSession, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
+    """Look up ProjectVersionAiRun by externalRunId."""
+    query = select(PrismaProjectVersionAiRun).where(
+        PrismaProjectVersionAiRun.externalRunId == external_run_id
+    )
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def get_project_version(db: AsyncSession, project_version_id: str) -> Optional[PrismaProjectVersion]:
+    """Look up ProjectVersion by ID."""
+    query = select(PrismaProjectVersion).where(
+        PrismaProjectVersion.id == project_version_id
+    )
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
+
+def extract_campaign_inputs(project_version: PrismaProjectVersion) -> CampaignInputs:
+    """Extract campaign inputs from ProjectVersion."""
+    total_budget = extract_budget_from_goal_text(project_version.goalText)
+    direction = map_goal_mode_to_direction(project_version.goalMode)
+
+    return CampaignInputs(
+        customer_name=project_version.customer,
+        industry=project_version.industry,
+        brand_kpi=project_version.brandKpi,
+        media_channels=list(project_version.mediaChannels) if project_version.mediaChannels else [],
+        goal_mode=project_version.goalMode,
+        goal_text=project_version.goalText,
+        total_budget=total_budget,
+        direction=direction,
+    )
+
+
+# =============================================================================
+# Background Task: Full Pipeline Processing
+# =============================================================================
+
+async def run_full_pipeline_background(
+    external_run_id: int,
+    prisma_ai_run_id: str,
+    db_url: str,
+):
+    """Background task to run the full Stage 1-4 pipeline.
 
     This runs asynchronously after POST /runs returns.
+    All state is stored in ProjectVersionAiRun.
     """
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
     from sqlalchemy.orm import sessionmaker
@@ -81,216 +181,222 @@ async def run_stage1_background(run_id: int, db_url: str):
 
     async with async_session() as session:
         try:
-            run_repo = RunRepository(session)
-            run = await run_repo.get(run_id)
+            # Get the AI run record
+            query = select(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.id == prisma_ai_run_id
+            )
+            result = await session.execute(query)
+            ai_run = result.scalar_one_or_none()
 
-            if not run:
-                logger.error(f"Run {run_id} not found for Stage 1 processing")
+            if not ai_run:
+                logger.error(f"ProjectVersionAiRun {prisma_ai_run_id} not found")
                 return
 
-            # Update status to matching
-            await run_repo.update_status(run_id, DBRunStatus.MATCHING)
-            await session.commit()
+            # Get ProjectVersion for inputs
+            project_version = await get_project_version(session, ai_run.projectVersionId)
+            if not project_version:
+                logger.error(f"ProjectVersion {ai_run.projectVersionId} not found")
+                await _update_ai_run_status(session, ai_run, "failed", error="ProjectVersion not found")
+                return
 
-            # Execute Stage 1
+            # Extract campaign inputs
+            inputs = extract_campaign_inputs(project_version)
+            logger.info(f"[ExternalRunId {external_run_id}] Starting pipeline for {inputs.customer_name}")
+
+            # Update status to matching (Stage 1)
+            await _update_ai_run_status(session, ai_run, "matching", stage="S1", progress_pct=10)
+
+            # =================================================================
+            # Stage 1: Competitor Matching
+            # =================================================================
             orchestrator = Stage1Orchestrator(session=session)
 
             user_input = UserCampaignInput(
-                brand_name=run.customer_name,
-                industry=run.industry,
-                brand_kpi=run.brand_kpi,
-                media_channels=run.input_parameters.get("channels", []) if run.input_parameters else [],
-                goal_direction=run.input_parameters.get("direction", "budget_to_impact") if run.input_parameters else "budget_to_impact",
+                brand_name=inputs.customer_name,
+                industry=inputs.industry,
+                brand_kpi=inputs.brand_kpi,
+                media_channels=inputs.media_channels,
+                goal_direction=inputs.direction,
             )
 
-            # Pass run_id for debug logging (enabled via STAGE1_DEBUG_MODE env var)
-            result = await orchestrator.process(user_input, run_id=str(run_id))
+            stage1_result = await orchestrator.process(user_input, run_id=str(external_run_id))
 
-            if result.status == Stage1Status.COMPLETED:
-                # Store Stage 1 results in run
-                run.confirmed_competitors = {
-                    "stage1_result": {
-                        "yougov_sectors": result.yougov_sectors,
-                        "nielsen_sectors": result.nielsen_sectors,
-                        "confirmed_brand": {
-                            "yougov_brand": result.confirmed_brand.yougov_brand,
-                            "nielsen_brand": result.confirmed_brand.nielsen_brand,
-                            "match_type": result.confirmed_brand.match_type.value,
-                            "confidence": result.confirmed_brand.confidence,
-                        } if result.confirmed_brand else None,
-                        "competitors": [
-                            {
-                                "brand_label": c.brand_label,
-                                "nielsen_brand": c.nielsen_brand,
-                                "avg_kpi_score": c.avg_kpi_score,
-                                "total_spend_teuro": c.total_spend_teuro,
-                            }
-                            for c in result.competitors
-                        ],
-                        "brand_data": {
-                            "brand_label": result.brand_data.brand_label,
-                            "sector_label": result.brand_data.sector_label,
-                            "adaware_score": result.brand_data.adaware_score,
-                            "aware_score": result.brand_data.aware_score,
-                            "consider_score": result.brand_data.consider_score,
-                            "total_spend_teuro": result.brand_data.total_spend_teuro,
-                            "channel_spend": result.brand_data.channel_spend,
-                        } if result.brand_data else None,
-                    },
-                    "pending_confirmation": True,
-                }
-
-                # Update status to awaiting confirmation
-                await run_repo.update_status(run_id, DBRunStatus.AWAITING_CONFIRMATION)
-                await session.commit()
-                logger.info(f"Stage 1 completed for run {run_id}, awaiting competitor confirmation")
-
-            elif result.status == Stage1Status.FAILED:
-                await run_repo.update_status(
-                    run_id,
-                    DBRunStatus.FAILED,
-                    error_message="; ".join(result.errors) if result.errors else "Stage 1 failed"
-                )
-                await session.commit()
-                logger.error(f"Stage 1 failed for run {run_id}: {result.errors}")
-
-        except Exception as e:
-            logger.error(f"Stage 1 background task failed for run {run_id}: {str(e)}")
-            try:
-                await run_repo.update_status(run_id, DBRunStatus.FAILED, error_message=str(e))
-                await session.commit()
-            except:
-                pass
-
-
-# =============================================================================
-# Background Task: Stage 2-4 Processing (AI Generation)
-# =============================================================================
-
-async def run_ai_generation_background(run_id: int, db_url: str):
-    """Background task to run Stage 2-4 (AI generation).
-
-    This runs asynchronously after POST /competitors/confirm returns.
-    """
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-    from sqlalchemy.orm import sessionmaker
-
-    engine = create_async_engine(db_url)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-    async with async_session() as session:
-        try:
-            run_repo = RunRepository(session)
-            run = await run_repo.get(run_id)
-
-            if not run:
-                logger.error(f"Run {run_id} not found for AI generation")
+            if stage1_result.status == Stage1Status.FAILED:
+                error_msg = "; ".join(stage1_result.errors) if stage1_result.errors else "Stage 1 failed"
+                await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                logger.error(f"[ExternalRunId {external_run_id}] Stage 1 failed: {error_msg}")
                 return
 
-            # Initialize services
-            prompt_service = PromptAssemblyService(session)
-            output_service = OutputParsingService(session)
-            feedback_service = FeedbackGenerationService(session)
-            trace_logger = PromptTraceLogger(session)
-            llm_client = OpenAIClient()
+            # Store competitor data
+            confirmed_names = [c.brand_label for c in stage1_result.competitors]
+            competitor_snapshot = _build_competitor_snapshot(stage1_result, inputs.industry)
 
-            # Build prompt assembly input
-            total_budget = Decimal(str(run.total_budget)) if run.total_budget else None
-            channels = run.input_parameters.get("channels") if run.input_parameters else None
+            ai_run.confirmedCompetitors = confirmed_names
+            ai_run.competitorSnapshot = competitor_snapshot
+            await session.commit()
+
+            logger.info(f"[ExternalRunId {external_run_id}] Stage 1 completed, {len(confirmed_names)} competitors found")
+
+            # =================================================================
+            # Stage 2: AI Allocation Generation
+            # =================================================================
+            await _update_ai_run_status(session, ai_run, "generating", stage="S2", progress_pct=40)
+
+            llm_client = OpenAIClient()
+            prompt_service = PromptAssemblyService(session)
+
+            # Build prompt
+            total_budget = Decimal(str(inputs.total_budget)) if inputs.total_budget else None
 
             prompt_input = PromptAssemblyInput(
-                customer_name=run.customer_name,
-                industry=run.industry,
-                brand_kpi=run.brand_kpi,
+                customer_name=inputs.customer_name,
+                industry=inputs.industry,
+                brand_kpi=inputs.brand_kpi,
                 total_budget=total_budget,
-                time_period_start=run.time_period_start,
-                time_period_end=run.time_period_end,
-                channels=channels,
-                nielsen_brands=[run.customer_name],
-                yougov_brands=[run.customer_name],
-                additional_context=run.input_parameters.get("goal_text") if run.input_parameters else None,
+                time_period_start=None,
+                time_period_end=None,
+                channels=inputs.media_channels,
+                nielsen_brands=[inputs.customer_name] + confirmed_names[:5],
+                yougov_brands=[inputs.customer_name] + confirmed_names[:5],
+                additional_context=inputs.goal_text,
             )
 
-            # Assemble the prompt
-            logger.info(f"[Run {run_id}] Assembling prompt...")
             assembled_prompt = await prompt_service.assemble_prompt(
                 input_params=prompt_input,
-                wirtschaftsgruppe=run.industry,
+                wirtschaftsgruppe=inputs.industry,
             )
 
-            # Start trace logging
-            full_prompt = f"SYSTEM:\n{assembled_prompt.system_prompt}\n\nUSER:\n{assembled_prompt.user_prompt}"
-            trace = await trace_logger.start_trace(
-                run_id=run_id,
-                model=llm_client.model,
-                prompt=full_prompt,
+            logger.info(f"[ExternalRunId {external_run_id}] Calling OpenAI...")
+
+            llm_response = await llm_client.generate(
+                system_prompt=assembled_prompt.system_prompt,
+                user_prompt=assembled_prompt.user_prompt,
+                temperature=0.7,
+                max_tokens=4096,
+                json_mode=True,
             )
 
-            # Call OpenAI
-            logger.info(f"[Run {run_id}] Calling OpenAI...")
+            logger.info(f"[ExternalRunId {external_run_id}] OpenAI response: {llm_response.total_tokens} tokens")
+
+            # =================================================================
+            # Stage 3: Parse Response
+            # =================================================================
+            await _update_ai_run_status(session, ai_run, "parsing", stage="S3", progress_pct=70)
+
+            # Parse LLM response
             try:
-                llm_response = await llm_client.generate(
-                    system_prompt=assembled_prompt.system_prompt,
-                    user_prompt=assembled_prompt.user_prompt,
-                    temperature=0.7,
-                    max_tokens=4096,
-                    json_mode=True,
-                )
-                await trace_logger.complete_trace(trace.id, llm_response)
-                logger.info(f"[Run {run_id}] OpenAI response: {llm_response.total_tokens} tokens")
-
-            except Exception as e:
-                await trace_logger.fail_trace(trace.id, str(e))
-                raise
-
-            # Update status to parsing
-            await run_repo.update_status(run_id, DBRunStatus.PARSING)
-            await session.commit()
-
-            # Parse and validate the response
-            logger.info(f"[Run {run_id}] Parsing LLM response...")
-            parsed_result = await output_service.parse_and_store(
-                run_id=run_id,
-                llm_response=llm_response,
-                total_budget=total_budget,
-            )
-
-            if not parsed_result.is_valid:
-                await run_repo.update_status(
-                    run_id,
-                    DBRunStatus.FAILED,
-                    error_message="LLM response failed validation"
-                )
-                await session.commit()
+                parsed_allocation = json.loads(llm_response.content)
+            except json.JSONDecodeError as e:
+                await _update_ai_run_status(session, ai_run, "failed", error=f"Failed to parse LLM response: {e}")
                 return
 
-            # Update status to feedback
-            await run_repo.update_status(run_id, DBRunStatus.FEEDBACK)
+            # Build allocation result
+            allocations = []
+            channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
+
+            for channel in channels_data:
+                allocations.append({
+                    "channel": channel.get("name", channel.get("channel", "Unknown")),
+                    "share_pct": float(channel.get("percentage", channel.get("share_pct", 0))),
+                    "budget_gross_eur": float(channel.get("amount", channel.get("budget", 0))) if channel.get("amount") or channel.get("budget") else None,
+                    "reasoning": channel.get("rationale", channel.get("reasoning", "")),
+                })
+
+            # =================================================================
+            # Stage 4: Store Results
+            # =================================================================
+            await _update_ai_run_status(session, ai_run, "completing", stage="S4", progress_pct=90)
+
+            allocation_result = {
+                "run_id": external_run_id,
+                "allocations": allocations,
+                "total_budget_eur": inputs.total_budget,
+                "kpi_projection": None,
+                "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
+                "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
+                "warnings": [],
+                "is_cached": False,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+            # Store in ProjectVersionAiRun
+            ai_run.allocationResult = allocation_result
+            ai_run.status = "completed"
+            ai_run.completedAt = datetime.utcnow()
+            ai_run.updatedAt = datetime.utcnow()
+            ai_run.progressPct = 100
+            ai_run.stage = None
             await session.commit()
 
-            # Generate feedback cards
-            logger.info(f"[Run {run_id}] Generating feedback...")
-            await feedback_service.generate_and_store(
-                run_id=run_id,
-                parsed_result=parsed_result,
-                run=run,
-            )
-
-            # Mark as completed
-            run.status = DBRunStatus.COMPLETED.value
-            run.completed_at = datetime.now(timezone.utc)
-            await session.commit()
-
-            logger.info(f"[Run {run_id}] AI generation completed successfully")
+            logger.info(f"[ExternalRunId {external_run_id}] Pipeline completed successfully")
 
         except Exception as e:
-            logger.error(f"AI generation failed for run {run_id}: {str(e)}")
+            logger.error(f"[ExternalRunId {external_run_id}] Pipeline failed: {str(e)}", exc_info=True)
             try:
-                run_repo = RunRepository(session)
-                await run_repo.update_status(run_id, DBRunStatus.FAILED, error_message=str(e))
-                await session.commit()
-            except:
-                pass
+                await session.rollback()
+                # Try to update status to failed
+                query = select(PrismaProjectVersionAiRun).where(
+                    PrismaProjectVersionAiRun.id == prisma_ai_run_id
+                )
+                result = await session.execute(query)
+                ai_run = result.scalar_one_or_none()
+                if ai_run:
+                    await _update_ai_run_status(session, ai_run, "failed", error=str(e))
+            except Exception as e2:
+                logger.error(f"Failed to update status after error: {e2}")
+
+
+async def _update_ai_run_status(
+    session: AsyncSession,
+    ai_run: PrismaProjectVersionAiRun,
+    status: str,
+    stage: Optional[str] = None,
+    progress_pct: Optional[int] = None,
+    error: Optional[str] = None,
+):
+    """Update ProjectVersionAiRun status fields."""
+    ai_run.status = status
+    ai_run.updatedAt = datetime.utcnow()
+
+    if stage is not None:
+        ai_run.stage = stage
+    if progress_pct is not None:
+        ai_run.progressPct = progress_pct
+    if error is not None:
+        ai_run.errorMessage = error
+    if status == "matching":
+        ai_run.startedAt = datetime.utcnow()
+
+    await session.commit()
+
+
+def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
+    """Build the competitor snapshot JSON for ProjectVersionAiRun.competitorSnapshot."""
+    competitors = []
+    for c in result.competitors:
+        competitors.append({
+            "nielsen_brand": c.nielsen_brand,
+            "yougov_brand_label": c.brand_label,
+            "wirtschaftsgruppe": industry,
+            "has_nielsen_data": c.nielsen_brand is not None,
+            "has_yougov_data": True,
+            "total_spend_eur": c.total_spend_teuro * 1000 if c.total_spend_teuro else None,
+            "match_confidence": 1.0,
+            "avg_kpi_score": c.avg_kpi_score,
+        })
+
+    return {
+        "competitors": competitors,
+        "brand_info": {
+            "brand_label": result.confirmed_brand.yougov_brand if result.confirmed_brand else None,
+            "nielsen_brand": result.confirmed_brand.nielsen_brand if result.confirmed_brand else None,
+            "match_type": result.confirmed_brand.match_type.value if result.confirmed_brand else None,
+            "confidence": result.confirmed_brand.confidence if result.confirmed_brand else None,
+        } if result.confirmed_brand else None,
+        "yougov_sectors": result.yougov_sectors,
+        "nielsen_sectors": result.nielsen_sectors,
+    }
 
 
 # =============================================================================
@@ -299,147 +405,81 @@ async def run_ai_generation_background(run_id: int, db_url: str):
 
 @router.post(
     "",
-    response_model=RunResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=StartRunResponse,
+    status_code=status.HTTP_200_OK,
     responses={
-        201: {"description": "Run created and Stage 1 started"},
+        200: {"description": "Run started successfully"},
         400: {"model": ErrorResponse, "description": "Invalid request"},
-        401: {"model": ErrorResponse, "description": "Unauthorized"},
+        404: {"model": ErrorResponse, "description": "ProjectVersionAiRun not found"},
         429: {"model": ErrorResponse, "description": "Rate limit exceeded"},
     },
 )
 @limiter.limit("20/hour")
 async def create_run(
     request: Request,
-    run_request: CreateRunRequest,
-    background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
-) -> RunResponse:
-    """Create a new generation run.
-
-    Creates a new budget allocation run and automatically starts Stage 1
-    (competitor matching) in the background.
-
-    Multiple runs can be created per session - no session lock.
-
-    Rate limit: 20 generations per user per hour.
-
-    After creation:
-    1. Poll GET /runs/{id}/status until status = "awaiting_confirmation"
-    2. GET /runs/{id}/competitors to see matched competitors
-    3. POST /runs/{id}/competitors/confirm to proceed
-    """
-    from src.config import get_settings
-    settings = get_settings()
-
-    session: SessionContext = await get_session_context(request)
-    run_repo = RunRepository(db)
-
-    # Create the run (NO session lock - allow multiple runs)
-    run = await run_repo.create_run(
-        session_token=session.session_token,
-        customer_name=run_request.customer_name,
-        industry=run_request.industry,
-        brand_kpi=run_request.brand_kpi,
-        user_id=session.user_id,
-        total_budget=float(run_request.total_budget) if run_request.total_budget else None,
-        time_period_start=run_request.time_period_start,
-        time_period_end=run_request.time_period_end,
-        input_parameters={
-            "channels": run_request.channels,
-            "goal_text": run_request.goal_text,
-            "direction": run_request.direction,
-        } if any([run_request.channels, run_request.goal_text, run_request.direction]) else None,
-    )
-
-    await db.commit()
-
-    # Start Stage 1 in background
-    background_tasks.add_task(
-        run_stage1_background,
-        run_id=run.id,
-        db_url=settings.database_url,
-    )
-
-    logger.info(f"Run {run.id} created, Stage 1 starting in background")
-
-    return RunResponse(
-        id=run.id,
-        session_token=run.session_token,
-        customer_name=run.customer_name,
-        industry=run.industry,
-        brand_kpi=run.brand_kpi,
-        total_budget=run.total_budget,
-        time_period_start=run.time_period_start,
-        time_period_end=run.time_period_end,
-        status=RunStatus(run.status),
-        started_at=run.started_at,
-        completed_at=run.completed_at,
-        error_message=run.error_message,
-        created_at=run.created_at,
-        updated_at=run.updated_at,
-    )
-
-
-@router.post(
-    "/start",
-    response_model=StartRunResponse,
-    responses={
-        200: {"description": "Run started successfully"},
-        400: {"model": ErrorResponse, "description": "Run cannot be started"},
-        404: {"model": ErrorResponse, "description": "Run not found"},
-    },
-)
-async def start_run(
-    request: Request,
-    start_request: StartRunRequest,
+    run_request: StartRunRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> StartRunResponse:
-    """Start processing for an existing run (Manager's Spec v2).
+    """Start a new generation run.
 
-    The run must already exist in DB (created by JS Backend).
-    This endpoint triggers Stage 1 (competitor matching) in background.
+    Request body: {run_id, action: "start"}
 
-    This is different from POST /runs which creates AND starts a run.
-    Use this endpoint when the JS Backend has already created the run.
+    The run_id is the externalRunId from ProjectVersionAiRun (set by JS Backend).
+
+    This endpoint:
+    1. Looks up ProjectVersionAiRun by externalRunId
+    2. Gets ProjectVersion and extracts campaign inputs
+    3. Starts the full Stage 1-4 pipeline in background
+    4. Stores results in ProjectVersionAiRun.allocationResult
 
     After starting:
-    1. Poll GET /runs/{id}/status until status = "awaiting_confirmation"
-    2. GET /runs/{id}/competitors to see matched competitors
-    3. POST /runs/competitors/confirm to proceed
+    1. Poll GET /runs/{run_id}/status until "completed"
+    2. GET /runs/{run_id}/result for allocation
     """
     from src.config import get_settings
     settings = get_settings()
 
-    run_repo = RunRepository(db)
-    run = await run_repo.get(start_request.run_id)
+    external_run_id = run_request.run_id
 
-    if not run:
-        return StartRunResponse(
-            run_id=start_request.run_id,
-            status="error",
-            error_message=f"Run {start_request.run_id} not found"
+    # Look up ProjectVersionAiRun by externalRunId
+    ai_run = await get_ai_run_by_external_id(db, external_run_id)
+
+    if not ai_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ProjectVersionAiRun with externalRunId {external_run_id} not found",
         )
 
-    if run.status != DBRunStatus.PENDING.value:
-        return StartRunResponse(
-            run_id=run.id,
-            status="error",
-            error_message=f"Run already started (status: {run.status})"
+    # Get ProjectVersion for campaign inputs
+    project_version = await get_project_version(db, ai_run.projectVersionId)
+
+    if not project_version:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"ProjectVersion {ai_run.projectVersionId} not found",
         )
 
-    # Trigger Stage 1 in background
+    # Update ProjectVersionAiRun to pending status
+    ai_run.status = "pending"
+    ai_run.progressPct = 0
+    ai_run.stage = None
+    ai_run.errorMessage = None
+    ai_run.updatedAt = datetime.utcnow()
+    await db.commit()
+
+    # Start full pipeline in background
     background_tasks.add_task(
-        run_stage1_background,
-        run_id=run.id,
+        run_full_pipeline_background,
+        external_run_id=external_run_id,
+        prisma_ai_run_id=ai_run.id,
         db_url=settings.database_url,
     )
 
-    logger.info(f"Run {run.id} started via /start endpoint, Stage 1 starting in background")
+    logger.info(f"Run started for externalRunId={external_run_id}, ProjectVersionAiRun={ai_run.id}")
 
     return StartRunResponse(
-        run_id=run.id,
+        run_id=external_run_id,
         status="started",
         error_message=None
     )
@@ -450,8 +490,6 @@ async def start_run(
     response_model=RunStatusResponse,
     responses={
         200: {"description": "Run status retrieved"},
-        401: {"model": ErrorResponse, "description": "Unauthorized"},
-        403: {"model": ErrorResponse, "description": "Forbidden - not your run"},
         404: {"model": ErrorResponse, "description": "Run not found"},
     },
 )
@@ -463,192 +501,124 @@ async def get_run_status(
     """Get the status of a generation run.
 
     Use this endpoint to poll for run completion.
+    The run_id is the externalRunId from ProjectVersionAiRun.
 
     Status progression:
-    - pending → matching (Stage 1) → awaiting_confirmation (Stage 1.5)
-    - [after confirm] → generating (Stage 2) → parsing (Stage 3) → feedback (Stage 4) → completed
-    - Any stage can transition to failed or cancelled
+    - pending → matching (S1) → generating (S2) → parsing (S3) → completing (S4) → completed
+    - Any stage can transition to failed
     """
-    session: SessionContext = await get_session_context(request)
-    run_repo = RunRepository(db)
+    ai_run = await get_ai_run_by_external_id(db, run_id)
 
-    run = await run_repo.get(run_id)
-    if not run:
+    if not ai_run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run {run_id} not found",
+            detail=f"Run with externalRunId {run_id} not found",
         )
 
-    # Verify the run belongs to this session (or user is owner)
-    if run.session_token != session.session_token and not session.is_owner:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied - this run belongs to a different session",
-        )
-
-    # Map status to stage
-    stage_map = {
-        DBRunStatus.PENDING.value: None,
-        DBRunStatus.MATCHING.value: "S1",
-        DBRunStatus.AWAITING_CONFIRMATION.value: "S1.5",
-        DBRunStatus.GENERATING.value: "S2",
-        DBRunStatus.PARSING.value: "S3",
-        DBRunStatus.FEEDBACK.value: "S4",
-        DBRunStatus.COMPLETED.value: None,
-        DBRunStatus.FAILED.value: None,
-        DBRunStatus.CANCELLED.value: None,
+    # Map status to our RunStatus enum
+    status_map = {
+        "pending": RunStatus.PENDING,
+        "matching": RunStatus.MATCHING,
+        "generating": RunStatus.GENERATING,
+        "parsing": RunStatus.PARSING,
+        "completing": RunStatus.FEEDBACK,
+        "completed": RunStatus.COMPLETED,
+        "failed": RunStatus.FAILED,
+        "cancelled": RunStatus.CANCELLED,
     }
 
     # Generate human-readable progress message
     progress_messages = {
-        DBRunStatus.PENDING.value: "Queued for processing",
-        DBRunStatus.MATCHING.value: "Finding competitor brands (Stage 1)...",
-        DBRunStatus.AWAITING_CONFIRMATION.value: "Waiting for competitor confirmation (Stage 1.5)",
-        DBRunStatus.GENERATING.value: "Generating allocation with AI (Stage 2)...",
-        DBRunStatus.PARSING.value: "Processing results (Stage 3)...",
-        DBRunStatus.FEEDBACK.value: "Generating feedback cards (Stage 4)...",
-        DBRunStatus.COMPLETED.value: "Completed",
-        DBRunStatus.FAILED.value: "Failed",
-        DBRunStatus.CANCELLED.value: "Cancelled",
-    }
-
-    # Estimate progress percentage
-    progress_pct_map = {
-        DBRunStatus.PENDING.value: 0,
-        DBRunStatus.MATCHING.value: 20,
-        DBRunStatus.AWAITING_CONFIRMATION.value: 30,
-        DBRunStatus.GENERATING.value: 50,
-        DBRunStatus.PARSING.value: 75,
-        DBRunStatus.FEEDBACK.value: 90,
-        DBRunStatus.COMPLETED.value: 100,
-        DBRunStatus.FAILED.value: 0,
-        DBRunStatus.CANCELLED.value: 0,
+        "pending": "Queued for processing",
+        "matching": "Finding competitor brands (Stage 1)...",
+        "generating": "Generating allocation with AI (Stage 2)...",
+        "parsing": "Processing results (Stage 3)...",
+        "completing": "Finalizing results (Stage 4)...",
+        "completed": "Completed",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
     }
 
     return RunStatusResponse(
-        id=run.id,
-        status=RunStatus(run.status),
-        stage=stage_map.get(run.status),
-        progress_pct=progress_pct_map.get(run.status, 0),
-        started_at=run.started_at,
-        completed_at=run.completed_at,
-        error_message=run.error_message,
-        progress=progress_messages.get(run.status, "Processing..."),
-    )
-
-
-@router.post(
-    "/{run_id}/stop",
-    response_model=StopRunResponse,
-    responses={
-        200: {"description": "Run stopped successfully"},
-        400: {"model": ErrorResponse, "description": "Run cannot be stopped"},
-        401: {"model": ErrorResponse, "description": "Unauthorized"},
-        403: {"model": ErrorResponse, "description": "Forbidden - not your run"},
-        404: {"model": ErrorResponse, "description": "Run not found"},
-    },
-)
-async def stop_run(
-    request: Request,
-    run_id: int,
-    stop_request: Optional[StopRunRequest] = None,
-    db: AsyncSession = Depends(get_db),
-) -> StopRunResponse:
-    """Stop/cancel a generation run.
-
-    Cancels an in-flight or queued run. If the LLM call is in progress,
-    the stream will be discarded and a partial prompt trace recorded.
-
-    Already completed, failed, or cancelled runs cannot be stopped.
-    """
-    session: SessionContext = await get_session_context(request)
-    run_repo = RunRepository(db)
-
-    run = await run_repo.get(run_id)
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run {run_id} not found",
-        )
-
-    # Verify the run belongs to this session (or user is owner)
-    if run.session_token != session.session_token and not session.is_owner:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied - this run belongs to a different session",
-        )
-
-    # Check if run can be stopped
-    terminal_statuses = [
-        DBRunStatus.COMPLETED.value,
-        DBRunStatus.FAILED.value,
-        DBRunStatus.CANCELLED.value,
-    ]
-    if run.status in terminal_statuses:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Run cannot be stopped - already in terminal state: {run.status}",
-        )
-
-    # Cancel the run
-    reason = stop_request.reason if stop_request else None
-    run = await run_repo.mark_cancelled(run_id, reason)
-    await db.commit()
-
-    return StopRunResponse(
-        id=run.id,
-        status=RunStatus(run.status),
-        stopped_at=run.completed_at or datetime.now(timezone.utc),
-        message="Run cancelled successfully",
+        id=run_id,
+        status=status_map.get(ai_run.status, RunStatus.PENDING),
+        stage=ai_run.stage,
+        progress_pct=ai_run.progressPct or 0,
+        started_at=ai_run.startedAt,
+        completed_at=ai_run.completedAt,
+        error_message=ai_run.errorMessage,
+        progress=progress_messages.get(ai_run.status, "Processing..."),
     )
 
 
 @router.get(
-    "/{run_id}",
-    response_model=RunResponse,
+    "/{run_id}/result",
     responses={
-        200: {"description": "Run details retrieved"},
-        401: {"model": ErrorResponse, "description": "Unauthorized"},
-        403: {"model": ErrorResponse, "description": "Forbidden - not your run"},
+        200: {"description": "Allocation result retrieved"},
         404: {"model": ErrorResponse, "description": "Run not found"},
+        400: {"model": ErrorResponse, "description": "Run not completed"},
     },
 )
-async def get_run(
+async def get_run_result(
     request: Request,
     run_id: int,
     db: AsyncSession = Depends(get_db),
-) -> RunResponse:
-    """Get full details of a generation run."""
-    session: SessionContext = await get_session_context(request)
-    run_repo = RunRepository(db)
+):
+    """Get the allocation result for a completed run.
 
-    run = await run_repo.get(run_id)
-    if not run:
+    The run_id is the externalRunId from ProjectVersionAiRun.
+    Returns the allocationResult JSON stored in ProjectVersionAiRun.
+    """
+    ai_run = await get_ai_run_by_external_id(db, run_id)
+
+    if not ai_run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run {run_id} not found",
+            detail=f"Run with externalRunId {run_id} not found",
         )
 
-    # Verify the run belongs to this session (or user is owner)
-    if run.session_token != session.session_token and not session.is_owner:
+    if ai_run.status != "completed":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied - this run belongs to a different session",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Run is not completed. Current status: {ai_run.status}",
         )
 
-    return RunResponse(
-        id=run.id,
-        session_token=run.session_token,
-        customer_name=run.customer_name,
-        industry=run.industry,
-        brand_kpi=run.brand_kpi,
-        total_budget=run.total_budget,
-        time_period_start=run.time_period_start,
-        time_period_end=run.time_period_end,
-        status=RunStatus(run.status),
-        started_at=run.started_at,
-        completed_at=run.completed_at,
-        error_message=run.error_message,
-        created_at=run.created_at,
-        updated_at=run.updated_at,
-    )
+    if not ai_run.allocationResult:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No allocation result found for this run",
+        )
+
+    return ai_run.allocationResult
+
+
+@router.get(
+    "/{run_id}/competitors",
+    responses={
+        200: {"description": "Competitor data retrieved"},
+        404: {"model": ErrorResponse, "description": "Run not found"},
+    },
+)
+async def get_run_competitors(
+    request: Request,
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the competitor data for a run.
+
+    The run_id is the externalRunId from ProjectVersionAiRun.
+    Returns confirmedCompetitors and competitorSnapshot from ProjectVersionAiRun.
+    """
+    ai_run = await get_ai_run_by_external_id(db, run_id)
+
+    if not ai_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run with externalRunId {run_id} not found",
+        )
+
+    return {
+        "run_id": run_id,
+        "confirmed_competitors": ai_run.confirmedCompetitors or [],
+        "competitor_snapshot": ai_run.competitorSnapshot,
+    }
