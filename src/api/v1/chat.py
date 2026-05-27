@@ -9,7 +9,7 @@ Endpoints:
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -35,8 +35,8 @@ class ChatMessageRequest(BaseModel):
 
     run_id: int = Field(..., description="externalRunId from ProjectVersionAiRun")
     message: str = Field(..., min_length=1, max_length=2000, description="User's message")
-    project_id: Optional[str] = Field(None, description="Optional project ID")
-    version_id: Optional[str] = Field(None, description="Optional version ID")
+    project_id: Optional[Union[str, int]] = Field(None, description="Optional project ID (string or int)")
+    version_id: Optional[Union[str, int]] = Field(None, description="Optional version ID (string or int)")
 
 
 class ChatMessageResponse(BaseModel):
