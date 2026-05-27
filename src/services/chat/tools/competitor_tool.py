@@ -14,6 +14,7 @@ from typing import List, Optional, Dict, Any
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from src.db.models.prisma_tables import PrismaProjectVersionAiRun
 from src.db.models.data import YouGov, Nielsen
@@ -349,17 +350,37 @@ class CompetitorManagementTool:
         Args:
             run_id: externalRunId
             competitors: New list of competitors
+
+        Raises:
+            ValueError: If the run is not found
+            Exception: If database update fails
         """
-        query = select(PrismaProjectVersionAiRun).where(
-            PrismaProjectVersionAiRun.externalRunId == run_id
-        )
-        result = await self.session.execute(query)
-        ai_run = result.scalar_one_or_none()
+        try:
+            query = select(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.externalRunId == run_id
+            )
+            result = await self.session.execute(query)
+            ai_run = result.scalar_one_or_none()
 
-        if not ai_run:
-            raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
+            if not ai_run:
+                raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
 
-        # Update confirmedCompetitors array
-        ai_run.confirmedCompetitors = competitors
+            # Validate competitors list
+            if competitors is None:
+                competitors = []
 
-        await self.session.flush()
+            # Filter out empty strings and None values
+            competitors = [c for c in competitors if c and isinstance(c, str)]
+
+            # Update confirmedCompetitors array - MUST use flag_modified for ARRAY columns
+            ai_run.confirmedCompetitors = competitors
+            flag_modified(ai_run, 'confirmedCompetitors')
+
+            await self.session.flush()
+            logger.info(f"Updated competitors for run {run_id}: {len(competitors)} competitors")
+
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating competitors for run {run_id}: {e}")
+            raise Exception(f"Failed to update competitors: {str(e)}")

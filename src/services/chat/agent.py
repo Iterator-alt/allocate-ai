@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, List, Union
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from fastapi import BackgroundTasks
 
 from src.db.models.prisma_tables import PrismaProjectVersionAiRun
@@ -376,9 +377,10 @@ class ChatAgent:
         chat_snapshot["messages"] = messages
         chat_snapshot["updated_at"] = datetime.utcnow().isoformat()
 
-        # Update the AI run
+        # Update the AI run - MUST use flag_modified for JSONB columns
         ai_run.chatSnapshot = chat_snapshot
         ai_run.updatedAt = datetime.utcnow()
+        flag_modified(ai_run, 'chatSnapshot')
 
         await self.session.flush()
 
