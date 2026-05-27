@@ -14,8 +14,10 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.repositories import ExpertKnowledgeRepository, PromptGuardrailsRepository
 from src.services.mediamix.data_filtering import DataFilteringService, DataFilteringResult
+
+# NOTE: ExpertKnowledgeRepository and PromptGuardrailsRepository are not used
+# in Prisma-only mode as the tables don't exist. Default values are used instead.
 
 
 @dataclass
@@ -106,8 +108,9 @@ Provide your recommendation in the following JSON format:
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.knowledge_repo = ExpertKnowledgeRepository(session)
-        self.guardrails_repo = PromptGuardrailsRepository(session)
+        # PRISMA-ONLY MODE: Don't initialize repos for tables that don't exist
+        # self.knowledge_repo = ExpertKnowledgeRepository(session)
+        # self.guardrails_repo = PromptGuardrailsRepository(session)
         self.data_service = DataFilteringService(session)
 
     async def assemble_prompt(

@@ -204,13 +204,14 @@ class DataFeasibilityGuard:
         brand_kpi: str,
         require_full_data: bool,
     ) -> List[str]:
-        """Check data availability and return warnings."""
+        """Check data availability and return warnings.
+
+        PRISMA-ONLY MODE: No industry_map table, use industry as sector directly.
+        """
         warnings = []
 
-        # Get sector label for YouGov check
-        sector_label = await self.industry_repo.get_sector_label(industry)
-        if not sector_label:
-            return warnings
+        # PRISMA-ONLY MODE: Use industry name as sector_label directly
+        sector_label = industry
 
         # Check Nielsen data
         nielsen_brands = await self.nielsen_repo.get_brands_in_industry(industry)
@@ -293,8 +294,10 @@ class DataFeasibilityGuard:
         """Get all available options for industries, channels, and KPIs.
 
         Useful for frontend dropdown population.
+
+        PRISMA-ONLY MODE: Get industries from Nielsen directly.
         """
-        industries = await self.industry_repo.get_all_wirtschaftsgruppen()
+        industries = await self.nielsen_repo.get_wirtschaftsgruppen()
         channels = await self.nielsen_repo.get_channels()
         sectors = await self.yougov_repo.get_sectors()
 
