@@ -5,11 +5,15 @@ Assembles the final LLM prompt from:
 2. Expert knowledge (from database)
 3. Guardrails (from database)
 4. User input parameters
+
+Supports two modes:
+- BUDGET_TO_IMPACT: Customer has fixed budget, optimize KPI
+- GOAL_TO_BUDGET: Customer has KPI goal, calculate required budget
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +22,9 @@ from src.services.mediamix.data_filtering import DataFilteringService, DataFilte
 
 # NOTE: ExpertKnowledgeRepository and PromptGuardrailsRepository are not used
 # in Prisma-only mode as the tables don't exist. Default values are used instead.
+
+# Goal direction modes
+GoalDirection = Literal["budget_to_impact", "goal_to_budget", "increase", "maintain", "decrease"]
 
 
 @dataclass
@@ -46,6 +53,9 @@ class PromptAssemblyInput:
     nielsen_brands: List[str]
     yougov_brands: List[str]
     additional_context: Optional[str] = None
+    goal_direction: Optional[str] = None  # "budget_to_impact" or "goal_to_budget" or "increase"
+    goal_text: Optional[str] = None  # Original goal text for Goal→Budget mode
+    customer_historical_spend: Optional[float] = None  # Customer's historical total spend in EUR
 
 
 class PromptAssemblyService:
@@ -53,53 +63,147 @@ class PromptAssemblyService:
 
     Combines competitor data, expert knowledge, and guardrails
     into a structured prompt format.
+
+    Supports two modes:
+    - BUDGET_TO_IMPACT: Fixed budget, optimize for KPI improvement
+    - GOAL_TO_BUDGET: KPI goal given, calculate required budget
     """
 
     # Default system prompt template
-    SYSTEM_PROMPT_TEMPLATE = """You are an expert media planner specializing in budget allocation optimization.
+    SYSTEM_PROMPT_TEMPLATE = """You are an expert media planner. Your recommendations must be DATA-DRIVEN, based on the competitor spend and KPI data provided.
 
-Your task is to analyze competitor advertising data and recommend a channel allocation strategy that will optimize the target KPI metric.
+CRITICAL INSTRUCTIONS:
+1. Base ALL allocation percentages on competitor spend ratios from the data
+2. Each channel rationale MUST cite specific competitor names, spend amounts (in EUR), and KPI changes
+3. Do NOT use generic phrases like "broad reach" or "precise targeting" - use actual data
+4. The summary MUST name which competitors were used as benchmarks
 
-You must:
-1. Analyze the competitor spend patterns
-2. Consider industry benchmarks
-3. Apply media planning best practices
-4. Recommend a channel allocation that sums to 100%
+REASONING FORMAT FOR EACH CHANNEL:
+- Name the competitor(s) who spent on this channel
+- State their exact spend amount in EUR
+- State their KPI change (e.g., -1.21pp)
+- Explain why this informs your allocation
 
-Your response must be in valid JSON format following the specified schema.
+Example rationale: "Müller spent €195M on FERNSEHEN with -1.21pp awareness change (best in sector). Landliebe spent €79M with -4.10pp. TV dominates competitor spend (60% of total), recommending 40% allocation."
 
 {guardrails}
 """
 
-    # Default user prompt template
-    USER_PROMPT_TEMPLATE = """## Client Information
+    # User prompt template for BUDGET_TO_IMPACT mode
+    BUDGET_TO_IMPACT_TEMPLATE = """## Client Information
 - **Client**: {customer_name}
 - **Industry**: {industry}
 - **Target KPI**: {brand_kpi}
-{budget_line}
+- **Total Budget**: €{total_budget:,.2f}
 {time_period_line}
 {channels_line}
 
-## Competitor Analysis Data
+## Mode: BUDGET → IMPACT
+Customer has a gross budget of €{total_budget:,.2f}. Recommend how to split this budget based on competitor spend patterns.
+
+## Competitor Spend & KPI Data
 {data_context}
 
-## Expert Knowledge
-{expert_knowledge}
+## ALLOCATION RULES (Data-Driven)
+1. Calculate the total competitor spend per channel from the data above
+2. Use competitor channel mix ratios as your starting point for allocation percentages
+3. Adjust based on KPI efficiency: favor channels where competitors achieved better KPI results
+4. The competitor with the smallest KPI decline (closest to 0 or positive) is the most efficient benchmark
 
 ## Your Task
-Based on the competitor data and expert knowledge above, recommend an optimal channel allocation strategy for {customer_name}.
+Recommend an optimal channel allocation for {customer_name} based on the competitor benchmarks above.
 
-Provide your recommendation in the following JSON format:
+MANDATORY REQUIREMENTS:
+1. Each channel rationale MUST name specific competitors and their spend amounts
+2. Rationale MUST reference the competitor's KPI change for that channel
+3. Explain how competitor spend ratios influenced your percentage allocation
+4. The summary MUST state which competitor(s) were used as the primary benchmark and why
+
+Return JSON:
 ```json
 {{
   "allocations": [
-    {{"channel": "channel_name", "percentage": 35.0, "amount": 350000.00, "rationale": "brief explanation"}},
+    {{"channel": "CHANNEL_NAME", "percentage": 35.0, "amount": 350000.00, "rationale": "[Competitor] spent €[X]M on [channel] with [Y]pp KPI change. Based on their [efficiency/dominance], allocating [Z]%."}},
     ...
   ],
   "total_percentage": 100.0,
-  "summary": "Brief 2-3 sentence summary of the strategy",
+  "total_budget_eur": {total_budget},
+  "kpi_projection": 1.5,
+  "summary": "Using [Competitor1] and [Competitor2] as benchmarks (combined spend €X, KPI changes of Y and Z). Strategy focuses on [reasoning based on their data].",
   "confidence": 0.85,
-  "warnings": ["any data quality or coverage warnings"]
+  "warnings": ["any data quality issues"]
+}}
+```
+
+{additional_context}
+"""
+
+    # User prompt template for GOAL_TO_BUDGET mode
+    GOAL_TO_BUDGET_TEMPLATE = """## Client Information
+- **Client**: {customer_name}
+- **Industry**: {industry}
+- **Target KPI**: {brand_kpi}
+- **Customer Historical Spend**: {customer_historical_spend_line}
+{time_period_line}
+{channels_line}
+
+## Mode: GOAL → BUDGET
+Customer goal is: {goal_text}
+
+No fixed budget — calculate the required budget based on competitor spend efficiency data.
+
+## Competitor Spend & KPI Data
+{data_context}
+
+## CRITICAL: BUDGET CALCULATION RULES
+
+### Rule 1: Handle Negative Sector KPI Trends
+If ALL competitors show NEGATIVE KPI uplift (sector-wide decline), do NOT extrapolate that more spend = positive uplift.
+Instead reason like this:
+- "Sector shows awareness decline of approximately X pp over the period despite heavy spending."
+- "To achieve +Ypp uplift, the brand needs to reverse a sector trend, which requires strategic differentiation."
+- "Based on sector average spend levels and customer scale, a realistic budget to defend and grow against this trend is approximately €Z."
+
+### Rule 2: Anchor Budget to Customer's Historical Spend
+The customer ({customer_name}) has historical spend of approximately {customer_historical_spend_formatted}.
+- Use the CUSTOMER's own historical spend as the baseline anchor — NOT the sector leader's spend.
+- A realistic budget recommendation should be between 0.5x and 5x their historical spend.
+- Only exceed 5x if there is strong data evidence to justify it (e.g., dramatic market entry or category expansion).
+
+### Rule 3: Sanity Check
+If your calculated budget exceeds 10x the customer's historical spend, you MUST:
+- Add a warning: "Calculated budget significantly exceeds historical spend benchmarks for this brand — treat as indicative only."
+- Consider whether a more conservative estimate is appropriate.
+
+### Rule 4: Calculation Logic
+1. Calculate sector average KPI change (e.g., average of all competitor KPI changes)
+2. Note that achieving POSITIVE uplift in a declining sector requires outperforming competitors
+3. Use customer historical spend as baseline: recommend 1x-3x for moderate goals, 3x-5x for aggressive goals
+4. Channel allocation percentages should mirror the most efficient competitor's channel mix
+
+## Your Task
+Calculate the required budget and recommend channel allocation for {customer_name} to achieve: {goal_text}
+
+MANDATORY REQUIREMENTS:
+1. Acknowledge if sector shows overall negative KPI trend
+2. Anchor budget calculation to customer's historical spend level
+3. Each channel rationale MUST name competitors and their spend amounts
+4. Explain why achieving positive uplift in this sector is challenging (if applicable)
+5. The summary MUST state the budget relative to customer's historical spend
+
+Return JSON:
+```json
+{{
+  "allocations": [
+    {{"channel": "CHANNEL_NAME", "percentage": 35.0, "amount": 350000.00, "rationale": "[Competitor] spent €[X]M on [channel] with [Y]pp KPI change. Based on their spend ratio, allocating [Z]%."}},
+    ...
+  ],
+  "total_percentage": 100.0,
+  "total_budget_eur": 1500000.00,
+  "kpi_projection": 3.0,
+  "summary": "Sector shows [X]pp average decline. Customer historical spend is €Y. To achieve +Zpp against this trend, recommending budget of €W (approximately Nx historical spend). Using [Competitor] channel mix as benchmark.",
+  "confidence": 0.85,
+  "warnings": ["any data quality issues", "add warning if budget exceeds 10x historical spend"]
 }}
 ```
 
@@ -112,6 +216,27 @@ Provide your recommendation in the following JSON format:
         # self.knowledge_repo = ExpertKnowledgeRepository(session)
         # self.guardrails_repo = PromptGuardrailsRepository(session)
         self.data_service = DataFilteringService(session)
+
+    def _is_budget_to_impact_mode(self, input_params: PromptAssemblyInput) -> bool:
+        """Determine if we're in Budget→Impact mode.
+
+        Budget→Impact: User has a fixed budget
+        Goal→Budget: User has a goal but no fixed budget
+        """
+        # If we have a budget, it's Budget→Impact mode
+        if input_params.total_budget and input_params.total_budget > 0:
+            return True
+
+        # Check goal_direction explicitly
+        if input_params.goal_direction:
+            direction = input_params.goal_direction.lower()
+            if direction == "budget_to_impact":
+                return True
+            if direction == "goal_to_budget":
+                return False
+
+        # Default: if no budget, it's Goal→Budget mode
+        return False
 
     async def assemble_prompt(
         self,
@@ -150,8 +275,9 @@ Provide your recommendation in the following JSON format:
             guardrails=guardrails,
         )
 
-        # Build user prompt
-        user_prompt = self._build_user_prompt(input_params, data_context, expert_knowledge)
+        # Build user prompt based on mode
+        is_budget_mode = self._is_budget_to_impact_mode(input_params)
+        user_prompt = self._build_user_prompt(input_params, data_context, expert_knowledge, is_budget_mode)
 
         # Metadata for tracing
         metadata = {
@@ -159,10 +285,16 @@ Provide your recommendation in the following JSON format:
             "industry": input_params.industry,
             "brand_kpi": input_params.brand_kpi,
             "total_budget": str(input_params.total_budget) if input_params.total_budget else None,
+            "goal_direction": input_params.goal_direction,
+            "goal_text": input_params.goal_text,
+            "mode": "budget_to_impact" if is_budget_mode else "goal_to_budget",
             "year": data_result.year,
             "num_competitors": len(data_result.competitor_spend_profiles),
             "num_kpi_profiles": len(data_result.competitor_kpi_profiles),
             "channels_available": len(data_result.all_channels),
+            "relationship_table_rows": len(data_result.relationship_table) if data_result.relationship_table else 0,
+            "kpi_uplifts_count": len(data_result.kpi_uplifts) if data_result.kpi_uplifts else 0,
+            "data_warnings": data_result.warnings if data_result.warnings else [],
             "assembled_at": datetime.utcnow().isoformat(),
         }
 
@@ -198,13 +330,9 @@ Provide your recommendation in the following JSON format:
         input_params: PromptAssemblyInput,
         data_context: str,
         expert_knowledge: str,
+        is_budget_mode: bool,
     ) -> str:
-        """Build the user prompt from template."""
-        # Budget line
-        budget_line = ""
-        if input_params.total_budget:
-            budget_line = f"- **Total Budget**: €{input_params.total_budget:,.2f}"
-
+        """Build the user prompt from template based on mode."""
         # Time period line
         time_period_line = ""
         if input_params.time_period_start and input_params.time_period_end:
@@ -219,40 +347,71 @@ Provide your recommendation in the following JSON format:
 
         # Additional context
         additional_context = ""
-        if input_params.additional_context:
+        if input_params.additional_context and is_budget_mode:
+            # In budget mode, additional_context is extra info
             additional_context = f"\n## Additional Context\n{input_params.additional_context}"
 
-        return self.USER_PROMPT_TEMPLATE.format(
-            customer_name=input_params.customer_name,
-            industry=input_params.industry,
-            brand_kpi=input_params.brand_kpi,
-            budget_line=budget_line,
-            time_period_line=time_period_line,
-            channels_line=channels_line,
-            data_context=data_context,
-            expert_knowledge=expert_knowledge,
-            additional_context=additional_context,
-        )
+        if is_budget_mode:
+            # BUDGET → IMPACT mode
+            total_budget = float(input_params.total_budget) if input_params.total_budget else 0
+            return self.BUDGET_TO_IMPACT_TEMPLATE.format(
+                customer_name=input_params.customer_name,
+                industry=input_params.industry,
+                brand_kpi=input_params.brand_kpi,
+                total_budget=total_budget,
+                time_period_line=time_period_line,
+                channels_line=channels_line,
+                data_context=data_context,
+                expert_knowledge=expert_knowledge,
+                additional_context=additional_context,
+            )
+        else:
+            # GOAL → BUDGET mode
+            goal_text = input_params.goal_text or input_params.additional_context or "Improve brand KPI"
+
+            # Format customer historical spend
+            customer_spend = input_params.customer_historical_spend or 0
+            if customer_spend > 0:
+                customer_historical_spend_line = f"€{customer_spend:,.0f}"
+                customer_historical_spend_formatted = f"€{customer_spend:,.0f}"
+            else:
+                customer_historical_spend_line = "Not available"
+                customer_historical_spend_formatted = "unknown (use sector average as proxy)"
+
+            return self.GOAL_TO_BUDGET_TEMPLATE.format(
+                customer_name=input_params.customer_name,
+                industry=input_params.industry,
+                brand_kpi=input_params.brand_kpi,
+                goal_text=goal_text,
+                time_period_line=time_period_line,
+                channels_line=channels_line,
+                data_context=data_context,
+                expert_knowledge=expert_knowledge,
+                additional_context="",  # Goal text is already in the template
+                customer_historical_spend_line=customer_historical_spend_line,
+                customer_historical_spend_formatted=customer_historical_spend_formatted,
+            )
 
     def _get_default_expert_knowledge(self) -> str:
-        """Default expert knowledge when database is empty."""
-        return """### Channel Heuristics
-- TV provides broad reach but lower targeting precision
-- Digital channels offer precise targeting and measurable ROI
-- Print works well for B2B and luxury segments
-- Radio is cost-effective for local reach
-- Out-of-home (OOH) drives brand awareness in urban areas
+        """Channel name mappings only - no generic advice."""
+        return """### Channel Name Reference
+- FERNSEHEN = TV
+- ONLINE = Digital/Online
+- PLAKAT = OOH/Outdoor/Billboards
+- RADIO = Radio
+- SOCIAL = Social Media
+- ZEITUNGEN = Newspapers
+- PUBLIKUMSZEITSCHRIFTEN = Consumer Magazines
+- FACHZEITSCHRIFTEN = Trade Publications
+- TRANSPORT MEDIA = Transit Advertising
+- AT-RETAIL-MEDIA = Retail/POS Media
+- KINO = Cinema
+- AMBIENT MEDIA = Ambient/Experiential
 
-### Budget Rules
-- Diversify across at least 3-4 channels for optimal reach
-- Allocate more to channels with proven ROI in your industry
-- Consider seasonality in channel effectiveness
-- Reserve 10-20% for emerging/testing channels
-
-### KPI Optimization
-- For ad awareness (adaware): prioritize high-reach channels (TV, OOH)
-- For aided recall (aided): focus on frequency and repetition
-- For consideration (consider): emphasize targeted digital and content marketing
+### Interpreting KPI Changes
+- Negative KPI changes (e.g., -1.21pp) are common due to market-wide trends
+- The competitor with the SMALLEST decline (closest to 0) is most efficient
+- Compare relative performance, not absolute values
 """
 
     def _get_default_guardrails(self) -> str:
@@ -260,19 +419,24 @@ Provide your recommendation in the following JSON format:
         return """### Output Format
 - Respond only in valid JSON format
 - Channel percentages must sum to exactly 100%
-- Include a brief rationale for each channel allocation
-- Confidence score must be between 0 and 1
+- kpi_projection MUST be a numeric float, NEVER null
+
+### Data-Driven Rationale Requirements
+- EVERY channel rationale must name at least one competitor
+- EVERY rationale must include a specific EUR spend amount from the data
+- EVERY rationale must reference a KPI change (e.g., "-1.21pp")
+- NO generic phrases like "broad reach", "precise targeting", "cost-effective"
+- The summary MUST name the benchmark competitors used
 
 ### Value Constraints
 - Minimum channel allocation: 5%
-- Maximum single channel allocation: 50%
+- Maximum single channel allocation: 60%
 - Allocate to at least 3 different channels
-- Do not exceed the total budget if specified
+- total_budget_eur must be a positive number, never 0 or null
 
-### Validation Rules
-- All numeric values must be positive
-- Channel names must match the available channels in the data
-- Include warnings for any data quality issues observed
+### Validation
+- Channel names should use the German names from the data (FERNSEHEN, ONLINE, etc.)
+- Include warnings for any data gaps or quality issues
 """
 
     def estimate_token_count(self, prompt: AssembledPrompt) -> int:

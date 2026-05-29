@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Stage 1 Debug Mode - saves intermediate results to /debug_output
-    stage1_debug_mode: bool = False
+    stage1_debug_mode: bool = True
 
     # Rate Limiting
     rate_limit_generations_per_hour: int = 20

@@ -183,7 +183,7 @@ class NielsenRepository(BaseRepository[Nielsen]):
                 "data_points": row.data_points,
                 "oldest_year": row.oldest_year,
                 "newest_year": row.newest_year,
-                "total_spend_eur": row.total_spend,
+                "total_spend_eur": row.total_spend * 1000 if row.total_spend else None,
                 "data_quality": "ideal" if row.oldest_year >= (self._current_year - IDEAL_DATA_AGE_YEARS) else "acceptable",
             }
             for row in result.all()
@@ -230,7 +230,7 @@ class NielsenRepository(BaseRepository[Nielsen]):
 
         result = await self.session.execute(query)
 
-        return {row.mediengruppe: Decimal(str(row.total_spend)) if row.total_spend else Decimal(0) for row in result.all() if row.mediengruppe}
+        return {row.mediengruppe: Decimal(str(row.total_spend * 1000)) if row.total_spend else Decimal(0) for row in result.all() if row.mediengruppe}
 
     async def get_total_spend(
         self,
@@ -250,7 +250,7 @@ class NielsenRepository(BaseRepository[Nielsen]):
 
         result = await self.session.execute(query)
         total = result.scalar_one_or_none()
-        return Decimal(str(total)) if total else None
+        return Decimal(str(total * 1000)) if total else None
 
     async def get_spend_matrix(
         self,
@@ -284,7 +284,7 @@ class NielsenRepository(BaseRepository[Nielsen]):
                 "brand_name": row.marke,
                 "channel": row.mediengruppe,
                 "month": MONTH_TO_NUM.get(row.monat, 0),  # Convert German month to number
-                "spend": Decimal(str(row.spend)) if row.spend else Decimal(0),
+                "spend": Decimal(str(row.spend * 1000)) if row.spend else Decimal(0),
             }
             for row in result.all()
         ]
@@ -397,7 +397,7 @@ class NielsenRepository(BaseRepository[Nielsen]):
                 "year": row.jahr,
                 "month": MONTH_TO_NUM.get(row.monat, 0),
                 "channel": row.mediengruppe,
-                "spend_eur": Decimal(str(row.teuro)) if row.teuro else Decimal(0),
+                "spend_eur": Decimal(str(row.teuro * 1000)) if row.teuro else Decimal(0),
             }
             for row in rows
         ]

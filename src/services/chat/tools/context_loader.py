@@ -165,19 +165,27 @@ class ContextLoaderTool:
 
     async def _get_ai_run(self, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
         """Get ProjectVersionAiRun by externalRunId."""
-        query = select(PrismaProjectVersionAiRun).where(
-            PrismaProjectVersionAiRun.externalRunId == external_run_id
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
+        try:
+            query = select(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.externalRunId == external_run_id
+            )
+            result = await self.session.execute(query)
+            return result.scalar_one_or_none()
+        except Exception as e:
+            logger.error(f"Error fetching ProjectVersionAiRun for externalRunId {external_run_id}: {e}")
+            return None
 
     async def _get_project_version(self, project_version_id: str) -> Optional[PrismaProjectVersion]:
         """Get ProjectVersion by ID."""
-        query = select(PrismaProjectVersion).where(
-            PrismaProjectVersion.id == project_version_id
-        )
-        result = await self.session.execute(query)
-        return result.scalar_one_or_none()
+        try:
+            query = select(PrismaProjectVersion).where(
+                PrismaProjectVersion.id == project_version_id
+            )
+            result = await self.session.execute(query)
+            return result.scalar_one_or_none()
+        except Exception as e:
+            logger.error(f"Error fetching ProjectVersion {project_version_id}: {e}")
+            return None
 
     def _get_messages_from_snapshot(
         self,

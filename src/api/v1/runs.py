@@ -4,6 +4,7 @@ Endpoints:
 - POST /runs - Start a new generation run (accepts {run_id, action: "start"})
 - GET /runs/{id}/status - Poll run state from ProjectVersionAiRun
 - GET /runs/{id}/result - Get allocation result from ProjectVersionAiRun
+- GET /runs/{id}/debug-zip - Download debug ZIP file (requires STAGE1_DEBUG_MODE=True)
 
 Flow:
 1. POST /runs with {run_id, action: "start"} where run_id = externalRunId from ProjectVersionAiRun
@@ -15,14 +16,18 @@ NO PYTHON TABLES REQUIRED - all state is stored in Prisma tables.
 """
 
 import logging
+import os
 import re
 import json
+import zipfile
+import shutil
 from datetime import datetime
 from typing import Optional, List
 from decimal import Decimal
 from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -120,8 +125,81 @@ def extract_budget_from_goal_text(goal_text: str) -> Optional[float]:
 
 
 def map_goal_mode_to_direction(goal_mode: str) -> str:
-    """Map Prisma goalMode to our direction format."""
-    return "increase" if goal_mode == "goal" else "budget_to_impact"
+    """Map Prisma goalMode to our direction format.
+
+    Prisma goalMode values:
+    - "goal": User has a KPI goal, calculate required budget (Goal→Budget)
+    - "budget": User has a fixed budget, optimize KPI (Budget→Impact)
+    """
+    if goal_mode == "goal":
+        return "goal_to_budget"
+    else:
+        return "budget_to_impact"
+
+
+# =============================================================================
+# Channel Name Mapping (Nielsen Mediengruppe → User-Facing Names)
+# =============================================================================
+
+# Map from Nielsen internal channel names to user-facing UI names
+NIELSEN_TO_UI_CHANNEL_MAP = {
+    "FERNSEHEN": "TV",
+    "ONLINE": "Digital",
+    "PLAKAT": "OOH",
+    "RADIO": "Radio",
+    "SOCIAL": "Social",
+    "ZEITUNGEN": "Print",  # Newspapers -> Print
+    "PUBLIKUMSZEITSCHRIFTEN": "Print",  # Magazines -> Print
+    "FACHZEITSCHRIFTEN": "Trade Press",
+    "AT-RETAIL-MEDIA": "Retail Media",
+    "SEARCH": "Search",
+    "KINO": "Cinema",
+    "TRANSPORT MEDIA": "Transport",
+    "AMBIENT MEDIA": "Ambient",
+    "WERBESENDUNGEN": "Direct Mail",
+}
+
+# Reverse mapping: UI names → Nielsen names (for filtering)
+# Note: "Print" maps to multiple Nielsen channels
+UI_TO_NIELSEN_CHANNEL_MAP = {
+    "TV": "FERNSEHEN",
+    "Digital": "ONLINE",
+    "OOH": "PLAKAT",
+    "Radio": "RADIO",
+    "Social": "SOCIAL",
+    "Print": ["ZEITUNGEN", "PUBLIKUMSZEITSCHRIFTEN"],  # Print maps to multiple
+    "Newspapers": "ZEITUNGEN",
+    "Magazines": "PUBLIKUMSZEITSCHRIFTEN",
+    "Trade Press": "FACHZEITSCHRIFTEN",
+    "Retail Media": "AT-RETAIL-MEDIA",
+    "Search": "SEARCH",
+    "Cinema": "KINO",
+    "Transport": "TRANSPORT MEDIA",
+    "Ambient": "AMBIENT MEDIA",
+    "Direct Mail": "WERBESENDUNGEN",
+}
+
+
+def map_nielsen_channel_to_ui(nielsen_channel: str) -> str:
+    """Map Nielsen Mediengruppe name to user-facing UI channel name."""
+    return NIELSEN_TO_UI_CHANNEL_MAP.get(nielsen_channel.upper(), nielsen_channel)
+
+
+def get_allowed_nielsen_channels(ui_channels: List[str]) -> set:
+    """Get set of Nielsen channel names that correspond to user-selected UI channels."""
+    allowed = set()
+    for ui_channel in ui_channels:
+        nielsen_name = UI_TO_NIELSEN_CHANNEL_MAP.get(ui_channel)
+        if nielsen_name:
+            # Handle case where UI channel maps to multiple Nielsen channels (e.g., Print)
+            if isinstance(nielsen_name, list):
+                allowed.update(nielsen_name)
+            else:
+                allowed.add(nielsen_name)
+        else:
+            # If no mapping found, allow exact match (case-insensitive)
+            allowed.add(ui_channel.upper())
+    return allowed
 
 
 async def get_ai_run_by_external_id(db: AsyncSession, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
@@ -228,14 +306,18 @@ async def run_full_pipeline_background(
                 return
 
             # Store competitor data
-            confirmed_names = [c.brand_label for c in stage1_result.competitors]
+            # YouGov brand labels (used as primary identifiers)
+            yougov_brands = [c.brand_label for c in stage1_result.competitors]
+            # Nielsen brand names (different naming convention, can be None)
+            nielsen_brands = [c.nielsen_brand for c in stage1_result.competitors if c.nielsen_brand]
+
             competitor_snapshot = _build_competitor_snapshot(stage1_result, inputs.industry)
 
-            ai_run.confirmedCompetitors = confirmed_names
+            ai_run.confirmedCompetitors = yougov_brands
             ai_run.competitorSnapshot = competitor_snapshot
             await session.commit()
 
-            logger.info(f"[ExternalRunId {external_run_id}] Stage 1 completed, {len(confirmed_names)} competitors found")
+            logger.info(f"[ExternalRunId {external_run_id}] Stage 1 completed: {len(yougov_brands)} YouGov brands, {len(nielsen_brands)} Nielsen brands")
 
             # =================================================================
             # Stage 2: AI Allocation Generation
@@ -248,6 +330,12 @@ async def run_full_pipeline_background(
             # Build prompt
             total_budget = Decimal(str(inputs.total_budget)) if inputs.total_budget else None
 
+            # Get customer's historical spend from Stage 1 data
+            # NOTE: Despite the name 'total_spend_teuro', it's already converted to EUR in repository.py
+            customer_historical_spend = None
+            if stage1_result.brand_data and stage1_result.brand_data.total_spend_teuro:
+                customer_historical_spend = stage1_result.brand_data.total_spend_teuro  # Already in EUR
+
             prompt_input = PromptAssemblyInput(
                 customer_name=inputs.customer_name,
                 industry=inputs.industry,
@@ -256,15 +344,32 @@ async def run_full_pipeline_background(
                 time_period_start=None,
                 time_period_end=None,
                 channels=inputs.media_channels,
-                nielsen_brands=[inputs.customer_name] + confirmed_names[:5],
-                yougov_brands=[inputs.customer_name] + confirmed_names[:5],
+                # IMPORTANT: Use separate brand lists - YouGov and Nielsen have different naming conventions
+                nielsen_brands=nielsen_brands[:5],  # Nielsen brand names (e.g., "EHRMANN")
+                yougov_brands=yougov_brands[:5],    # YouGov brand labels (e.g., "Ehrmann Almighurt")
                 additional_context=inputs.goal_text,
+                goal_direction=inputs.direction,  # Pass direction to Stage 2
+                goal_text=inputs.goal_text,  # Pass goal text for Goal→Budget mode
+                customer_historical_spend=customer_historical_spend,  # Customer's historical spend in EUR
             )
 
             assembled_prompt = await prompt_service.assemble_prompt(
                 input_params=prompt_input,
                 wirtschaftsgruppe=inputs.industry,
             )
+
+            # DEBUG: Save prompt to file for debugging
+            from src.config import get_settings
+            if get_settings().stage1_debug_mode:
+                debug_dir = f"debug_output/run_{external_run_id}"
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(f"{debug_dir}/S2_prompt.txt", "w", encoding="utf-8") as f:
+                    f.write("=== SYSTEM PROMPT ===\n")
+                    f.write(assembled_prompt.system_prompt)
+                    f.write("\n\n=== USER PROMPT ===\n")
+                    f.write(assembled_prompt.user_prompt)
+                    f.write("\n\n=== METADATA ===\n")
+                    f.write(json.dumps(assembled_prompt.metadata, indent=2, default=str))
 
             logger.info(f"[ExternalRunId {external_run_id}] Calling OpenAI...")
 
@@ -278,6 +383,19 @@ async def run_full_pipeline_background(
 
             logger.info(f"[ExternalRunId {external_run_id}] OpenAI response: {llm_response.total_tokens} tokens")
 
+            # DEBUG: Save raw LLM response
+            if get_settings().stage1_debug_mode:
+                debug_dir = f"debug_output/run_{external_run_id}"
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(f"{debug_dir}/S2_llm_response.txt", "w", encoding="utf-8") as f:
+                    f.write("=== RAW LLM RESPONSE ===\n")
+                    f.write(f"Model: {llm_response.model}\n")
+                    f.write(f"Total Tokens: {llm_response.total_tokens}\n")
+                    f.write(f"Prompt Tokens: {llm_response.prompt_tokens}\n")
+                    f.write(f"Completion Tokens: {llm_response.completion_tokens}\n")
+                    f.write("\n=== CONTENT ===\n")
+                    f.write(llm_response.content)
+
             # =================================================================
             # Stage 3: Parse Response
             # =================================================================
@@ -290,9 +408,19 @@ async def run_full_pipeline_background(
                 await _update_ai_run_status(session, ai_run, "failed", error=f"Failed to parse LLM response: {e}")
                 return
 
+            # DEBUG: Save parsed allocation (raw from LLM before post-processing)
+            if get_settings().stage1_debug_mode:
+                with open(f"{debug_dir}/S2_parsed_raw.json", "w", encoding="utf-8") as f:
+                    json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
             # Build allocation result
             allocations = []
             channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
+
+            # Get user-selected channels and map to allowed Nielsen channel names
+            user_channels = inputs.media_channels or []
+            allowed_nielsen_channels = get_allowed_nielsen_channels(user_channels)
+            logger.info(f"[ExternalRunId {external_run_id}] User channels: {user_channels} -> Allowed Nielsen: {allowed_nielsen_channels}")
 
             # Try to extract total budget from LLM response if not in inputs
             total_budget = inputs.total_budget
@@ -303,6 +431,17 @@ async def run_full_pipeline_background(
                     total_budget = float(llm_total)
 
             for channel in channels_data:
+                # Get Nielsen channel name from LLM response
+                nielsen_channel = channel.get("name", channel.get("channel", "Unknown"))
+
+                # Filter: Only include channels the user selected
+                if allowed_nielsen_channels and nielsen_channel.upper() not in allowed_nielsen_channels:
+                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} - not in user selection")
+                    continue
+
+                # Map Nielsen channel name to user-facing UI name
+                ui_channel = map_nielsen_channel_to_ui(nielsen_channel)
+
                 # Get share percentage - handle various field names
                 share_pct = float(
                     channel.get("percentage") or
@@ -329,11 +468,99 @@ async def run_full_pipeline_background(
                     budget_gross_eur = None
 
                 allocations.append({
-                    "channel": channel.get("name", channel.get("channel", "Unknown")),
+                    "channel": ui_channel,  # Use UI channel name instead of Nielsen name
                     "share_pct": share_pct,
                     "budget_gross_eur": budget_gross_eur,
                     "reasoning": channel.get("rationale", channel.get("reasoning", "")),
                 })
+
+            # =================================================================
+            # Post-processing: Validate and normalize allocations
+            # =================================================================
+
+            # Step 1: Deduplicate channels (merge allocations for same underlying channel)
+            # This handles cases where user selected "Online" and LLM returned "ONLINE" -> "Digital"
+            channel_map = {}
+            for a in allocations:
+                channel_name = a["channel"]
+                if channel_name in channel_map:
+                    # Merge: add percentages and budgets
+                    channel_map[channel_name]["share_pct"] += a["share_pct"]
+                    if a["budget_gross_eur"] and channel_map[channel_name]["budget_gross_eur"]:
+                        channel_map[channel_name]["budget_gross_eur"] += a["budget_gross_eur"]
+                    # Append reasoning
+                    channel_map[channel_name]["reasoning"] += f" {a['reasoning']}"
+                else:
+                    channel_map[channel_name] = a.copy()
+
+            allocations = list(channel_map.values())
+            logger.info(f"[ExternalRunId {external_run_id}] After deduplication: {len(allocations)} unique channels")
+
+            # Step 2: Normalize user_channels to canonical UI names for comparison
+            # This handles cases where user selected "Online" which maps to "Digital"
+            normalized_user_channels = set()
+            for ch in user_channels:
+                # Check if user channel is a Nielsen name that should be mapped
+                nielsen_upper = ch.upper()
+                if nielsen_upper in NIELSEN_TO_UI_CHANNEL_MAP:
+                    # User used Nielsen name, map to UI name
+                    normalized_user_channels.add(NIELSEN_TO_UI_CHANNEL_MAP[nielsen_upper])
+                elif ch in UI_TO_NIELSEN_CHANNEL_MAP:
+                    # User used UI name, keep as-is
+                    normalized_user_channels.add(ch)
+                else:
+                    # Unknown channel, keep original
+                    normalized_user_channels.add(ch)
+
+            logger.info(f"[ExternalRunId {external_run_id}] User channels normalized: {user_channels} -> {normalized_user_channels}")
+
+            # Step 3: Normalize shares to 100% if needed
+            total_share = sum(a["share_pct"] for a in allocations)
+            if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                logger.warning(f"[ExternalRunId {external_run_id}] Share percentages sum to {total_share}%, normalizing to 100%")
+                scale_factor = 100.0 / total_share
+                for a in allocations:
+                    a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
+                    # Recalculate budget if we have total_budget
+                    if total_budget and a["share_pct"] > 0:
+                        a["budget_gross_eur"] = round(total_budget * a["share_pct"] / 100, 2)
+
+            # Step 4: Check for missing user-selected channels (using normalized names)
+            allocated_channels = {a["channel"] for a in allocations}
+            missing_channels = normalized_user_channels - allocated_channels
+
+            if missing_channels:
+                logger.warning(f"[ExternalRunId {external_run_id}] Missing user-selected channels: {missing_channels}")
+                # Add missing channels with minimal allocation (5% each, taken proportionally from existing)
+                for missing_ch in missing_channels:
+                    min_allocation = 5.0
+                    # Reduce existing allocations proportionally to make room
+                    reduction_factor = (100.0 - min_allocation) / 100.0 if allocations else 1.0
+                    for a in allocations:
+                        a["share_pct"] = round(a["share_pct"] * reduction_factor, 2)
+
+                    # Calculate budget for missing channel
+                    missing_budget = round(total_budget * min_allocation / 100, 2) if total_budget else None
+
+                    allocations.append({
+                        "channel": missing_ch,
+                        "share_pct": min_allocation,
+                        "budget_gross_eur": missing_budget,
+                        "reasoning": f"No competitor benchmark data available for {missing_ch}. Allocated minimum 5% as part of user's selected channel mix.",
+                    })
+
+                # Re-normalize to ensure exactly 100%
+                total_share = sum(a["share_pct"] for a in allocations)
+                if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                    scale_factor = 100.0 / total_share
+                    for a in allocations:
+                        a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
+                        if total_budget and a["share_pct"] > 0:
+                            a["budget_gross_eur"] = round(total_budget * a["share_pct"] / 100, 2)
+
+            # Log final allocation summary
+            final_total = sum(a["share_pct"] for a in allocations)
+            logger.info(f"[ExternalRunId {external_run_id}] Final allocations: {len(allocations)} channels, {final_total}% total")
 
             # =================================================================
             # Stage 4: Store Results
@@ -346,18 +573,54 @@ async def run_full_pipeline_background(
                 if budget_sum > 0:
                     total_budget = budget_sum
 
+            # Extract kpi_projection from LLM response - MUST NOT be null
+            kpi_projection_raw = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
+            kpi_projection = None
+            if kpi_projection_raw is not None:
+                try:
+                    kpi_projection = float(kpi_projection_raw)
+                except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse kpi_projection: {kpi_projection_raw}")
+                    kpi_projection = None
+
+            # If LLM didn't return kpi_projection, estimate based on mode
+            if kpi_projection is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return kpi_projection, defaulting to 0.0")
+                kpi_projection = 0.0
+
             allocation_result = {
                 "run_id": external_run_id,
                 "allocations": allocations,
                 "total_budget_eur": total_budget,
-                "kpi_projection": None,
+                "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
                 "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
-                "warnings": [],
+                "warnings": parsed_allocation.get("warnings", []),
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
             }
+
+            # DEBUG: Save final result (after post-processing)
+            if get_settings().stage1_debug_mode:
+                with open(f"{debug_dir}/S2_final_result.json", "w", encoding="utf-8") as f:
+                    json.dump(allocation_result, f, indent=2, ensure_ascii=False)
+                logger.info(f"[ExternalRunId {external_run_id}] Debug files saved to {debug_dir}/")
+
+                # Create ZIP archive of debug files
+                zip_path = f"debug_output/run_{external_run_id}.zip"
+                try:
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for root, dirs, files in os.walk(debug_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, debug_dir)
+                                zipf.write(file_path, arcname)
+                    # Delete the folder after successful ZIP creation
+                    shutil.rmtree(debug_dir)
+                    logger.info(f"[ExternalRunId {external_run_id}] Debug ZIP created: {zip_path}")
+                except Exception as zip_error:
+                    logger.warning(f"[ExternalRunId {external_run_id}] Failed to create debug ZIP: {zip_error}")
 
             # Store in ProjectVersionAiRun
             ai_run.allocationResult = allocation_result
@@ -661,3 +924,35 @@ async def get_run_competitors(
         "confirmed_competitors": ai_run.confirmedCompetitors or [],
         "competitor_snapshot": ai_run.competitorSnapshot,
     }
+
+
+@router.get(
+    "/{run_id}/debug-zip",
+    responses={
+        200: {"description": "Debug ZIP file download", "content": {"application/zip": {}}},
+        404: {"model": ErrorResponse, "description": "Debug ZIP not found"},
+    },
+)
+async def download_debug_zip(
+    request: Request,
+    run_id: int,
+):
+    """Download the debug ZIP file for a run.
+
+    The run_id is the externalRunId from ProjectVersionAiRun.
+    Returns the debug ZIP file if it exists.
+    Debug files are only created when STAGE1_DEBUG_MODE=True.
+    """
+    zip_path = f"debug_output/run_{run_id}.zip"
+
+    if not os.path.exists(zip_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Debug ZIP for run {run_id} not found. Debug mode may be disabled or run hasn't completed.",
+        )
+
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=f"run_{run_id}_debug.zip",
+    )

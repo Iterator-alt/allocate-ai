@@ -260,7 +260,7 @@ class NielsenBrandResolutionService:
             # Exact match found
             total_spend = Decimal("0")
             for record in spend_data:
-                total_spend += Decimal(str(record.teuro or 0))
+                total_spend += Decimal(str((record.teuro or 0) * 1000))
             data_months = len(set((r.jahr, r.monat) for r in spend_data))
 
             return {
@@ -286,7 +286,7 @@ class NielsenBrandResolutionService:
                     if spend_data:
                         total_spend = Decimal("0")
                         for record in spend_data:
-                            total_spend += Decimal(str(record.teuro or 0))
+                            total_spend += Decimal(str((record.teuro or 0) * 1000))
                         data_months = len(set((r.jahr, r.monat) for r in spend_data))
 
                         return {
