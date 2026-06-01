@@ -84,7 +84,7 @@ REASONING FORMAT FOR EACH CHANNEL:
 - State their KPI change (e.g., -1.21pp)
 - Explain why this informs your allocation
 
-Example rationale: "Müller spent €195M on FERNSEHEN with -1.21pp awareness change (best in sector). Landliebe spent €79M with -4.10pp. TV dominates competitor spend (60% of total), recommending 40% allocation."
+Example rationale: "[Competitor A] spent €X on [CHANNEL] with -Y.YYpp awareness change (best in sector). [Competitor B] spent €Z with -W.WWpp. [Channel] dominates competitor spend (X% of total), recommending Y% allocation."
 
 {guardrails}
 """
@@ -289,7 +289,7 @@ Return JSON:
             "goal_text": input_params.goal_text,
             "mode": "budget_to_impact" if is_budget_mode else "goal_to_budget",
             "year": data_result.year,
-            "num_competitors": len(data_result.competitor_spend_profiles),
+            "num_competitors": len(data_result.competitor_kpi_profiles),
             "num_kpi_profiles": len(data_result.competitor_kpi_profiles),
             "channels_available": len(data_result.all_channels),
             "relationship_table_rows": len(data_result.relationship_table) if data_result.relationship_table else 0,

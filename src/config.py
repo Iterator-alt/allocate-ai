@@ -44,8 +44,8 @@ class Settings(BaseSettings):
 
     # Competitor Confirmation Bypass
     # When True, auto-approve all competitors after Stage 1 and proceed directly to Stage 2
-    # When False, wait for user to confirm competitors via POST /runs/competitors/confirm
-    bypass_competitor_confirmation: bool = True
+    # When False, wait for user to confirm competitors via POST /runs/{id}/competitors/confirm
+    bypass_competitor_confirmation: bool = False
 
     @property
     def is_production(self) -> bool:

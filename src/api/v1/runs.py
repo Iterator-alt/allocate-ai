@@ -57,6 +57,7 @@ from src.services.stage1 import (
 # Stage 2-4 AI Pipeline imports
 from src.services.llm_gateway.client import OpenAIClient
 from src.services.mediamix.prompt_assembly import PromptAssemblyService, PromptAssemblyInput
+from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -313,11 +314,25 @@ async def run_full_pipeline_background(
 
             competitor_snapshot = _build_competitor_snapshot(stage1_result, inputs.industry)
 
-            ai_run.confirmedCompetitors = yougov_brands
             ai_run.competitorSnapshot = competitor_snapshot
             await session.commit()
 
             logger.info(f"[ExternalRunId {external_run_id}] Stage 1 completed: {len(yougov_brands)} YouGov brands, {len(nielsen_brands)} Nielsen brands")
+
+            # Check if we should wait for confirmation or auto-proceed
+            if not get_settings().bypass_competitor_confirmation:
+                # Wait for user confirmation via POST /runs/{id}/competitors/confirm
+                ai_run.status = "awaiting_confirmation"
+                ai_run.stage = None
+                ai_run.progressPct = 30
+                ai_run.updatedAt = datetime.utcnow()
+                await session.commit()
+                logger.info(f"[ExternalRunId {external_run_id}] Waiting for competitor confirmation")
+                return  # Stop here, Stage 2-4 will be triggered by confirm endpoint
+
+            # Auto-confirm competitors (bypass mode)
+            ai_run.confirmedCompetitors = yougov_brands
+            await session.commit()
 
             # =================================================================
             # Stage 2: AI Allocation Generation
@@ -359,7 +374,6 @@ async def run_full_pipeline_background(
             )
 
             # DEBUG: Save prompt to file for debugging
-            from src.config import get_settings
             if get_settings().stage1_debug_mode:
                 debug_dir = f"debug_output/run_{external_run_id}"
                 os.makedirs(debug_dir, exist_ok=True)
@@ -701,6 +715,349 @@ def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
     }
 
 
+async def _run_stages_2_to_4_pipeline(
+    prisma_ai_run_id: str,
+    external_run_id: int,
+    db_url: str,
+):
+    """Run Stages 2-4 after competitor confirmation.
+
+    This is called from the confirm endpoint after user approves competitors.
+    Stage 1 data is read from competitorSnapshot in the database.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_async_engine(db_url)
+    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with async_session() as session:
+        try:
+            # Get the AI run record
+            query = select(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.id == prisma_ai_run_id
+            )
+            result = await session.execute(query)
+            ai_run = result.scalar_one_or_none()
+
+            if not ai_run:
+                logger.error(f"ProjectVersionAiRun {prisma_ai_run_id} not found")
+                return
+
+            # Get ProjectVersion for inputs
+            project_version = await get_project_version(session, ai_run.projectVersionId)
+            if not project_version:
+                logger.error(f"ProjectVersion {ai_run.projectVersionId} not found")
+                await _update_ai_run_status(session, ai_run, "failed", error="ProjectVersion not found")
+                return
+
+            # Extract campaign inputs
+            inputs = extract_campaign_inputs(project_version)
+            logger.info(f"[ExternalRunId {external_run_id}] Starting Stage 2-4 pipeline for {inputs.customer_name}")
+
+            # Get confirmed competitors (set by frontend)
+            # confirmedCompetitors contains YouGov brand names (e.g., "Exquisa", "Landliebe")
+            confirmed_yougov = ai_run.confirmedCompetitors or []
+
+            # Look up Nielsen names from competitorSnapshot (stored during Stage 1)
+            # competitorSnapshot has both YouGov and Nielsen names for each competitor
+            snapshot = ai_run.competitorSnapshot or {}
+            snapshot_competitors = snapshot.get("competitors", [])
+
+            # Build mapping: YouGov name -> Nielsen name
+            yougov_to_nielsen = {
+                c.get("yougov_brand_label"): c.get("nielsen_brand")
+                for c in snapshot_competitors
+                if c.get("nielsen_brand")
+            }
+
+            # Map confirmed YouGov names to Nielsen names
+            yougov_brands = confirmed_yougov
+            nielsen_brands = [yougov_to_nielsen.get(yg) for yg in confirmed_yougov]
+            nielsen_brands = [n for n in nielsen_brands if n]  # Filter out None
+
+            logger.info(f"[ExternalRunId {external_run_id}] Confirmed: YouGov={yougov_brands}, Nielsen={nielsen_brands}")
+
+            # Customer historical spend - not available in Stage 2-4 standalone pipeline
+            customer_historical_spend = None
+
+            # =================================================================
+            # Stage 2: AI Allocation Generation
+            # =================================================================
+            await _update_ai_run_status(session, ai_run, "generating", stage="S2", progress_pct=40)
+
+            llm_client = OpenAIClient()
+            prompt_service = PromptAssemblyService(session)
+
+            # Build prompt
+            total_budget = Decimal(str(inputs.total_budget)) if inputs.total_budget else None
+
+            prompt_input = PromptAssemblyInput(
+                customer_name=inputs.customer_name,
+                industry=inputs.industry,
+                brand_kpi=inputs.brand_kpi,
+                total_budget=total_budget,
+                time_period_start=None,
+                time_period_end=None,
+                channels=inputs.media_channels,
+                nielsen_brands=nielsen_brands[:5],
+                yougov_brands=yougov_brands[:5],
+                additional_context=inputs.goal_text,
+                goal_direction=inputs.direction,
+                goal_text=inputs.goal_text,
+                customer_historical_spend=customer_historical_spend,
+            )
+
+            assembled_prompt = await prompt_service.assemble_prompt(
+                input_params=prompt_input,
+                wirtschaftsgruppe=inputs.industry,
+            )
+
+            # DEBUG: Save prompt to file for debugging
+            if get_settings().stage1_debug_mode:
+                debug_dir = f"debug_output/run_{external_run_id}"
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(f"{debug_dir}/S2_prompt.txt", "w", encoding="utf-8") as f:
+                    f.write("=== SYSTEM PROMPT ===\n")
+                    f.write(assembled_prompt.system_prompt)
+                    f.write("\n\n=== USER PROMPT ===\n")
+                    f.write(assembled_prompt.user_prompt)
+                    f.write("\n\n=== METADATA ===\n")
+                    f.write(json.dumps(assembled_prompt.metadata, indent=2, default=str))
+
+            logger.info(f"[ExternalRunId {external_run_id}] Calling OpenAI...")
+
+            llm_response = await llm_client.generate(
+                system_prompt=assembled_prompt.system_prompt,
+                user_prompt=assembled_prompt.user_prompt,
+                temperature=0.7,
+                max_tokens=4096,
+                json_mode=True,
+            )
+
+            logger.info(f"[ExternalRunId {external_run_id}] OpenAI response: {llm_response.total_tokens} tokens")
+
+            # DEBUG: Save raw LLM response
+            if get_settings().stage1_debug_mode:
+                debug_dir = f"debug_output/run_{external_run_id}"
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(f"{debug_dir}/S2_llm_response.txt", "w", encoding="utf-8") as f:
+                    f.write("=== RAW LLM RESPONSE ===\n")
+                    f.write(f"Model: {llm_response.model}\n")
+                    f.write(f"Total Tokens: {llm_response.total_tokens}\n")
+                    f.write(f"Prompt Tokens: {llm_response.prompt_tokens}\n")
+                    f.write(f"Completion Tokens: {llm_response.completion_tokens}\n")
+                    f.write("\n=== CONTENT ===\n")
+                    f.write(llm_response.content)
+
+            # =================================================================
+            # Stage 3: Parse Response
+            # =================================================================
+            await _update_ai_run_status(session, ai_run, "parsing", stage="S3", progress_pct=70)
+
+            try:
+                parsed_allocation = json.loads(llm_response.content)
+            except json.JSONDecodeError as e:
+                await _update_ai_run_status(session, ai_run, "failed", error=f"Failed to parse LLM response: {e}")
+                return
+
+            # DEBUG: Save parsed allocation
+            if get_settings().stage1_debug_mode:
+                with open(f"{debug_dir}/S2_parsed_raw.json", "w", encoding="utf-8") as f:
+                    json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
+            # Build allocation result (same logic as main pipeline)
+            allocations = []
+            channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
+
+            user_channels = inputs.media_channels or []
+            allowed_nielsen_channels = get_allowed_nielsen_channels(user_channels)
+
+            total_budget_val = inputs.total_budget
+            if not total_budget_val:
+                llm_total = parsed_allocation.get("totalBudgetEur", parsed_allocation.get("total_budget_eur"))
+                if llm_total:
+                    total_budget_val = float(llm_total)
+
+            for channel in channels_data:
+                nielsen_channel = channel.get("name", channel.get("channel", "Unknown"))
+
+                if allowed_nielsen_channels and nielsen_channel.upper() not in allowed_nielsen_channels:
+                    continue
+
+                ui_channel = map_nielsen_channel_to_ui(nielsen_channel)
+
+                share_pct = float(
+                    channel.get("percentage") or
+                    channel.get("share_pct") or
+                    channel.get("sharePct") or
+                    0
+                )
+
+                budget_value = (
+                    channel.get("amount") or
+                    channel.get("budget") or
+                    channel.get("budgetGrossEur") or
+                    channel.get("budget_gross_eur") or
+                    None
+                )
+
+                if budget_value:
+                    budget_gross_eur = float(budget_value)
+                elif total_budget_val and share_pct > 0:
+                    budget_gross_eur = round(total_budget_val * share_pct / 100, 2)
+                else:
+                    budget_gross_eur = None
+
+                allocations.append({
+                    "channel": ui_channel,
+                    "share_pct": share_pct,
+                    "budget_gross_eur": budget_gross_eur,
+                    "reasoning": channel.get("rationale", channel.get("reasoning", "")),
+                })
+
+            # Post-processing: deduplicate, normalize, add missing channels
+            channel_map = {}
+            for a in allocations:
+                channel_name = a["channel"]
+                if channel_name in channel_map:
+                    channel_map[channel_name]["share_pct"] += a["share_pct"]
+                    if a["budget_gross_eur"] and channel_map[channel_name]["budget_gross_eur"]:
+                        channel_map[channel_name]["budget_gross_eur"] += a["budget_gross_eur"]
+                    channel_map[channel_name]["reasoning"] += f" {a['reasoning']}"
+                else:
+                    channel_map[channel_name] = a.copy()
+
+            allocations = list(channel_map.values())
+
+            # Normalize user channels
+            normalized_user_channels = set()
+            for ch in user_channels:
+                nielsen_upper = ch.upper()
+                if nielsen_upper in NIELSEN_TO_UI_CHANNEL_MAP:
+                    normalized_user_channels.add(NIELSEN_TO_UI_CHANNEL_MAP[nielsen_upper])
+                elif ch in UI_TO_NIELSEN_CHANNEL_MAP:
+                    normalized_user_channels.add(ch)
+                else:
+                    normalized_user_channels.add(ch)
+
+            # Normalize shares to 100%
+            total_share = sum(a["share_pct"] for a in allocations)
+            if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                scale_factor = 100.0 / total_share
+                for a in allocations:
+                    a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
+                    if total_budget_val and a["share_pct"] > 0:
+                        a["budget_gross_eur"] = round(total_budget_val * a["share_pct"] / 100, 2)
+
+            # Add missing channels
+            allocated_channels = {a["channel"] for a in allocations}
+            missing_channels = normalized_user_channels - allocated_channels
+
+            if missing_channels:
+                for missing_ch in missing_channels:
+                    min_allocation = 5.0
+                    reduction_factor = (100.0 - min_allocation) / 100.0 if allocations else 1.0
+                    for a in allocations:
+                        a["share_pct"] = round(a["share_pct"] * reduction_factor, 2)
+
+                    missing_budget = round(total_budget_val * min_allocation / 100, 2) if total_budget_val else None
+
+                    allocations.append({
+                        "channel": missing_ch,
+                        "share_pct": min_allocation,
+                        "budget_gross_eur": missing_budget,
+                        "reasoning": f"No competitor benchmark data available for {missing_ch}. Allocated minimum 5%.",
+                    })
+
+                # Re-normalize
+                total_share = sum(a["share_pct"] for a in allocations)
+                if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                    scale_factor = 100.0 / total_share
+                    for a in allocations:
+                        a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
+                        if total_budget_val and a["share_pct"] > 0:
+                            a["budget_gross_eur"] = round(total_budget_val * a["share_pct"] / 100, 2)
+
+            # =================================================================
+            # Stage 4: Store Results
+            # =================================================================
+            await _update_ai_run_status(session, ai_run, "completing", stage="S4", progress_pct=90)
+
+            if not total_budget_val:
+                budget_sum = sum(a["budget_gross_eur"] or 0 for a in allocations)
+                if budget_sum > 0:
+                    total_budget_val = budget_sum
+
+            kpi_projection_raw = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
+            kpi_projection = None
+            if kpi_projection_raw is not None:
+                try:
+                    kpi_projection = float(kpi_projection_raw)
+                except (TypeError, ValueError):
+                    kpi_projection = None
+
+            if kpi_projection is None:
+                kpi_projection = 0.0
+
+            allocation_result = {
+                "run_id": external_run_id,
+                "allocations": allocations,
+                "total_budget_eur": total_budget_val,
+                "kpi_projection": kpi_projection,
+                "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
+                "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
+                "warnings": parsed_allocation.get("warnings", []),
+                "is_cached": False,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+            # DEBUG: Save final result and create ZIP
+            if get_settings().stage1_debug_mode:
+                with open(f"{debug_dir}/S2_final_result.json", "w", encoding="utf-8") as f:
+                    json.dump(allocation_result, f, indent=2, ensure_ascii=False)
+                logger.info(f"[ExternalRunId {external_run_id}] Debug files saved to {debug_dir}/")
+
+                zip_path = f"debug_output/run_{external_run_id}.zip"
+                try:
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for root, dirs, files in os.walk(debug_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.relpath(file_path, debug_dir)
+                                zipf.write(file_path, arcname)
+                    shutil.rmtree(debug_dir)
+                    logger.info(f"[ExternalRunId {external_run_id}] Debug ZIP created: {zip_path}")
+                except Exception as zip_error:
+                    logger.warning(f"[ExternalRunId {external_run_id}] Failed to create debug ZIP: {zip_error}")
+
+            # Store result
+            ai_run.allocationResult = allocation_result
+            ai_run.status = "completed"
+            ai_run.completedAt = datetime.utcnow()
+            ai_run.updatedAt = datetime.utcnow()
+            ai_run.progressPct = 100
+            ai_run.stage = None
+            await session.commit()
+
+            logger.info(f"[ExternalRunId {external_run_id}] Stage 2-4 pipeline completed successfully")
+
+        except Exception as e:
+            logger.error(f"[ExternalRunId {external_run_id}] Stage 2-4 pipeline failed: {str(e)}", exc_info=True)
+            try:
+                await session.rollback()
+                query = select(PrismaProjectVersionAiRun).where(
+                    PrismaProjectVersionAiRun.id == prisma_ai_run_id
+                )
+                result = await session.execute(query)
+                ai_run = result.scalar_one_or_none()
+                if ai_run:
+                    await _update_ai_run_status(session, ai_run, "failed", error=str(e))
+            except Exception as e2:
+                logger.error(f"Failed to update status after error: {e2}")
+
+
 # =============================================================================
 # API Endpoints
 # =============================================================================
@@ -739,7 +1096,6 @@ async def create_run(
     1. Poll GET /runs/{run_id}/status until "completed"
     2. GET /runs/{run_id}/result for allocation
     """
-    from src.config import get_settings
     settings = get_settings()
 
     external_run_id = run_request.run_id
@@ -821,6 +1177,7 @@ async def get_run_status(
     status_map = {
         "pending": RunStatus.PENDING,
         "matching": RunStatus.MATCHING,
+        "awaiting_confirmation": RunStatus.AWAITING_CONFIRMATION,
         "generating": RunStatus.GENERATING,
         "parsing": RunStatus.PARSING,
         "completing": RunStatus.FEEDBACK,
@@ -833,6 +1190,7 @@ async def get_run_status(
     progress_messages = {
         "pending": "Queued for processing",
         "matching": "Finding competitor brands (Stage 1)...",
+        "awaiting_confirmation": "Waiting for competitor confirmation...",
         "generating": "Generating allocation with AI (Stage 2)...",
         "parsing": "Processing results (Stage 3)...",
         "completing": "Finalizing results (Stage 4)...",
@@ -892,38 +1250,6 @@ async def get_run_result(
         )
 
     return ai_run.allocationResult
-
-
-@router.get(
-    "/{run_id}/competitors",
-    responses={
-        200: {"description": "Competitor data retrieved"},
-        404: {"model": ErrorResponse, "description": "Run not found"},
-    },
-)
-async def get_run_competitors(
-    request: Request,
-    run_id: int,
-    db: AsyncSession = Depends(get_db),
-):
-    """Get the competitor data for a run.
-
-    The run_id is the externalRunId from ProjectVersionAiRun.
-    Returns confirmedCompetitors and competitorSnapshot from ProjectVersionAiRun.
-    """
-    ai_run = await get_ai_run_by_external_id(db, run_id)
-
-    if not ai_run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Run with externalRunId {run_id} not found",
-        )
-
-    return {
-        "run_id": run_id,
-        "confirmed_competitors": ai_run.confirmedCompetitors or [],
-        "competitor_snapshot": ai_run.competitorSnapshot,
-    }
 
 
 @router.get(
