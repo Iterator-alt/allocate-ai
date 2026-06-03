@@ -203,10 +203,10 @@ class YouGovRepository(BaseRepository[YouGov]):
         Returns:
             List of dicts with year, month, and value
         """
-        # Map 'aided' to 'aware' for compatibility
+        # Map 'aware' to 'aided' for compatibility (DB has 'aided', users may ask for 'aware')
         metric_name = kpi_name
-        if kpi_name == "aided":
-            metric_name = "aware"
+        if kpi_name == "aware":
+            metric_name = "aided"
 
         min_year, max_year = self._get_valid_year_range()
 
@@ -302,10 +302,10 @@ class YouGovRepository(BaseRepository[YouGov]):
         kpi_name: str,
     ) -> Optional[Dict[str, Any]]:
         """Get the most recent KPI value for a brand."""
-        # Map 'aided' to 'aware' for compatibility
+        # Map 'aware' to 'aided' for compatibility (DB has 'aided', users may ask for 'aware')
         metric_name = kpi_name
-        if kpi_name == "aided":
-            metric_name = "aware"
+        if kpi_name == "aware":
+            metric_name = "aided"
 
         query = (
             select(
@@ -339,10 +339,10 @@ class YouGovRepository(BaseRepository[YouGov]):
         month: Optional[int] = None,
     ) -> Optional[Decimal]:
         """Get sector average for a KPI metric."""
-        # Map 'aided' to 'aware' for compatibility
+        # Map 'aware' to 'aided' for compatibility (DB has 'aided', users may ask for 'aware')
         metric_name = kpi_name
-        if kpi_name == "aided":
-            metric_name = "aware"
+        if kpi_name == "aware":
+            metric_name = "aided"
 
         conditions = [
             YouGov.sector_label == sector,
@@ -442,10 +442,10 @@ class YouGovRepository(BaseRepository[YouGov]):
         Returns:
             Number of valid data points
         """
-        # Map 'aided' to 'aware' for compatibility
+        # Map 'aware' to 'aided' for compatibility (DB has 'aided', users may ask for 'aware')
         metric_name = kpi_name
-        if kpi_name == "aided":
-            metric_name = "aware"
+        if kpi_name == "aware":
+            metric_name = "aided"
 
         min_year, max_year = self._get_valid_year_range()
 

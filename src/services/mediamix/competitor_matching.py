@@ -23,8 +23,6 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories import (
-    IndustryMapRepository,
-    BrandMapRepository,
     NielsenRepository,
     YouGovRepository,
 )
@@ -76,26 +74,28 @@ class IndustryLookupService:
     """Service for industry classification lookup.
 
     Maps Nielsen Wirtschaftsgruppe to YouGov sector_label.
+
+    PRISMA-ONLY MODE: The industry_map table doesn't exist.
+    Returns the wirtschaftsgruppe as-is for sector lookups.
     """
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.industry_repo = IndustryMapRepository(session)
+        self.nielsen_repo = NielsenRepository(session)
 
     async def lookup_sector(self, wirtschaftsgruppe: str) -> Optional[str]:
         """Look up the YouGov sector label for a Wirtschaftsgruppe.
 
-        Args:
-            wirtschaftsgruppe: Nielsen industry classification
-
-        Returns:
-            YouGov sector_label or None if not found
+        PRISMA-ONLY MODE: Returns wirtschaftsgruppe as-is (no mapping table).
         """
-        return await self.industry_repo.get_sector_label(wirtschaftsgruppe)
+        return wirtschaftsgruppe
 
     async def get_all_industries(self) -> List[str]:
-        """Get all available Wirtschaftsgruppen with mappings."""
-        return await self.industry_repo.get_all_wirtschaftsgruppen()
+        """Get all available Wirtschaftsgruppen.
+
+        PRISMA-ONLY MODE: Gets from Nielsen table directly.
+        """
+        return await self.nielsen_repo.get_wirtschaftsgruppen()
 
     async def find_similar_industries(
         self, wirtschaftsgruppe: str, limit: int = 5
@@ -103,7 +103,6 @@ class IndustryLookupService:
         """Find similar industry names for suggestions.
 
         Uses simple substring matching for MVP.
-        More sophisticated fuzzy matching can be added later.
         """
         all_industries = await self.get_all_industries()
 
@@ -227,11 +226,14 @@ class YouGovBrandQueryService:
 
 
 class NielsenBrandResolutionService:
-    """Service for resolving YouGov brands to Nielsen data."""
+    """Service for resolving YouGov brands to Nielsen data.
+
+    PRISMA-ONLY MODE: No brand_map table. Uses fuzzy matching to find
+    Nielsen brands that match YouGov brand labels directly.
+    """
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.brand_repo = BrandMapRepository(session)
         self.nielsen_repo = NielsenRepository(session)
 
     async def resolve_brand(
@@ -241,6 +243,8 @@ class NielsenBrandResolutionService:
     ) -> Optional[Dict[str, Any]]:
         """Resolve a YouGov brand to Nielsen data.
 
+        PRISMA-ONLY MODE: Uses fuzzy string matching instead of brand_map table.
+
         Args:
             yougov_brand_label: YouGov brand label
             wirtschaftsgruppe: Optional industry context for disambiguation
@@ -248,40 +252,54 @@ class NielsenBrandResolutionService:
         Returns:
             Dict with Nielsen brand info or None if no mapping
         """
-        # Get brand mappings that map to this YouGov label
-        mappings = await self.brand_repo.get_by_yougov_label(yougov_brand_label)
+        # PRISMA-ONLY MODE: Try to find a matching Nielsen brand by name
+        # First try exact match
+        spend_data = await self.nielsen_repo.get_by_brand(yougov_brand_label)
 
-        if not mappings:
-            return None
-
-        # Filter by wirtschaftsgruppe if provided
-        if wirtschaftsgruppe:
-            matching = [m for m in mappings if m.wirtschaftsgruppe == wirtschaftsgruppe]
-            if matching:
-                mappings = matching
-
-        # Take the highest confidence mapping
-        best_mapping = max(mappings, key=lambda m: m.confidence or 0)
-
-        # Get Nielsen spend data
-        spend_data = await self.nielsen_repo.get_by_brand(best_mapping.nielsen_brand)
-
-        total_spend = Decimal("0")
-        data_months = 0
         if spend_data:
+            # Exact match found
+            total_spend = Decimal("0")
             for record in spend_data:
-                total_spend += record.spend_eur
-            data_months = len(set((r.year, r.month) for r in spend_data))
+                total_spend += Decimal(str((record.teuro or 0) * 1000))
+            data_months = len(set((r.jahr, r.monat) for r in spend_data))
 
-        return {
-            "nielsen_brand": best_mapping.nielsen_brand,
-            "yougov_brand_label": yougov_brand_label,
-            "wirtschaftsgruppe": best_mapping.wirtschaftsgruppe,
-            "match_confidence": best_mapping.confidence,
-            "has_nielsen_data": len(spend_data) > 0,
-            "total_spend_eur": total_spend if spend_data else None,
-            "data_months": data_months,
-        }
+            return {
+                "nielsen_brand": yougov_brand_label,
+                "yougov_brand_label": yougov_brand_label,
+                "wirtschaftsgruppe": wirtschaftsgruppe,
+                "match_confidence": 1.0,
+                "has_nielsen_data": True,
+                "total_spend_eur": total_spend,
+                "data_months": data_months,
+            }
+
+        # Try fuzzy matching within the industry if specified
+        if wirtschaftsgruppe:
+            nielsen_brands = await self.nielsen_repo.get_brands_in_industry(wirtschaftsgruppe)
+
+            # Simple fuzzy matching: check if brand name is substring
+            yougov_lower = yougov_brand_label.lower()
+            for nielsen_brand in nielsen_brands:
+                nielsen_lower = nielsen_brand.lower()
+                if yougov_lower in nielsen_lower or nielsen_lower in yougov_lower:
+                    spend_data = await self.nielsen_repo.get_by_brand(nielsen_brand)
+                    if spend_data:
+                        total_spend = Decimal("0")
+                        for record in spend_data:
+                            total_spend += Decimal(str((record.teuro or 0) * 1000))
+                        data_months = len(set((r.jahr, r.monat) for r in spend_data))
+
+                        return {
+                            "nielsen_brand": nielsen_brand,
+                            "yougov_brand_label": yougov_brand_label,
+                            "wirtschaftsgruppe": wirtschaftsgruppe,
+                            "match_confidence": 0.8,  # Fuzzy match
+                            "has_nielsen_data": True,
+                            "total_spend_eur": total_spend,
+                            "data_months": data_months,
+                        }
+
+        return None
 
     async def get_nielsen_brands_in_industry(
         self, wirtschaftsgruppe: str
@@ -346,14 +364,15 @@ class CompetitorSetAssemblyService:
         sector_label = await self.industry_service.lookup_sector(wirtschaftsgruppe)
 
         if not sector_label:
+            # PRISMA-ONLY MODE: This shouldn't happen as lookup_sector returns wirtschaftsgruppe directly
             similar = await self.industry_service.find_similar_industries(wirtschaftsgruppe)
             return CompetitorSetResult(
                 industry=wirtschaftsgruppe,
                 sector_label="",
                 competitors=[],
                 is_feasible=False,
-                error_message=f"Industry '{wirtschaftsgruppe}' not found in mapping table",
-                suggestions=similar if similar else ["Check the industry_map table for available industries"],
+                error_message=f"Industry '{wirtschaftsgruppe}' not found in Nielsen data",
+                suggestions=similar if similar else ["Check available industries in Nielsen data"],
             )
 
         # ============================================================

@@ -68,13 +68,12 @@ class ConfirmCompetitorsRequestV2(BaseModel):
     """Request to confirm competitors (Manager's Spec v2 - run_id in body).
 
     This version moves run_id from URL path to request body.
-    Action accepts both 'approve' and 'approved' for compatibility.
+    Action accepts 'approved' or 'dismissed'.
     """
 
     run_id: int = Field(..., description="ID of the run to confirm")
     action: str = Field(
         ...,
-        pattern="^(approve|approved|cancel)$",
-        description="Action: 'approve', 'approved', or 'cancel'"
+        pattern="^(approved|dismissed)$",
+        description="Action: 'approved' to proceed with Stage 2, 'dismissed' to cancel the run"
     )
-    reason: Optional[str] = Field(None, max_length=500, description="Optional reason for cancellation")

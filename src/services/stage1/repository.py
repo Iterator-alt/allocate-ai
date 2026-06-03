@@ -424,7 +424,7 @@ class Stage1Repository:
         return [
             {
                 "mediengruppe": row.mediengruppe,
-                "total_spend": float(row.total_spend) if row.total_spend else 0.0,
+                "total_spend": float(row.total_spend * 1000) if row.total_spend else 0.0,
                 "jahr": row.jahr,
                 "monat": row.monat,
             }
@@ -474,7 +474,7 @@ class Stage1Repository:
         return [
             {
                 "marke": row.marke,
-                "total_spend": float(row.total_spend) if row.total_spend else 0.0,
+                "total_spend": float(row.total_spend * 1000) if row.total_spend else 0.0,
             }
             for row in result.all()
         ]
@@ -513,7 +513,7 @@ class Stage1Repository:
 
         result = await self.session.execute(query)
         total = result.scalar()
-        return float(total) if total else 0.0
+        return float(total * 1000) if total else 0.0
 
     async def get_nielsen_spend_by_channel(
         self,
@@ -559,7 +559,7 @@ class Stage1Repository:
         return [
             {
                 "mediengruppe": row.mediengruppe,
-                "total_spend": float(row.total_spend) if row.total_spend else 0.0,
+                "total_spend": float(row.total_spend * 1000) if row.total_spend else 0.0,
             }
             for row in result.all()
         ]

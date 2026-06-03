@@ -2,8 +2,10 @@
 
 Tool 1: Add/remove competitors from the analysis.
 - Searches YouGov and Nielsen databases for brand existence
-- Updates run.confirmed_competitors JSON
+- Updates ProjectVersionAiRun.confirmedCompetitors array
 - Records changes for rerun validation
+
+PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun instead of Python Run table.
 """
 
 import logging
@@ -14,7 +16,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from src.db.models import Run
+from src.db.models.prisma_tables import PrismaProjectVersionAiRun
 from src.db.models.data import YouGov, Nielsen
 from src.services.chat.tools.context_loader import ChatContext
 
@@ -64,7 +66,7 @@ class CompetitorManagementTool:
        - Both found → Add silently, confirm
        - YouGov only → Add with warning (partial data)
        - Neither found → "Not found in database"
-    5. Update run.confirmed_competitors JSON
+    5. Update ProjectVersionAiRun.confirmedCompetitors array
     6. Record change for rerun validation
 
     REMOVE Flow:
@@ -72,6 +74,8 @@ class CompetitorManagementTool:
     2. Remove from list → Confirm
     3. Update database
     4. Record change for rerun validation
+
+    PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun instead of Run table.
     """
 
     def __init__(self, session: AsyncSession):
@@ -86,7 +90,7 @@ class CompetitorManagementTool:
         """Add a competitor to the analysis.
 
         Args:
-            run_id: Run to update
+            run_id: externalRunId from ProjectVersionAiRun
             brand: Brand name to add
             context: Current chat context
 
@@ -130,7 +134,7 @@ class CompetitorManagementTool:
         # Use the matched name from YouGov if available, otherwise Nielsen
         canonical_brand = yougov_match or nielsen_match or brand_normalized
 
-        # Update the run's confirmed_competitors
+        # Update the ProjectVersionAiRun's confirmedCompetitors
         new_competitors = context.current_competitors + [canonical_brand]
         await self._update_competitors(run_id, new_competitors)
 
@@ -163,7 +167,7 @@ class CompetitorManagementTool:
         """Remove a competitor from the analysis.
 
         Args:
-            run_id: Run to update
+            run_id: externalRunId from ProjectVersionAiRun
             brand: Brand name to remove
             context: Current chat context
 
@@ -341,31 +345,42 @@ class CompetitorManagementTool:
         run_id: int,
         competitors: List[str],
     ) -> None:
-        """Update the confirmed_competitors JSON in the run.
+        """Update the confirmedCompetitors array in ProjectVersionAiRun.
 
-        Updates the "brands" field which takes priority in context_loader.
-        Also updates "confirmed_brands" for consistency.
+        Args:
+            run_id: externalRunId
+            competitors: New list of competitors
+
+        Raises:
+            ValueError: If the run is not found
+            Exception: If database update fails
         """
-        query = select(Run).where(Run.id == run_id)
-        result = await self.session.execute(query)
-        run = result.scalar_one_or_none()
+        try:
+            query = select(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.externalRunId == run_id
+            )
+            result = await self.session.execute(query)
+            ai_run = result.scalar_one_or_none()
 
-        if not run:
-            raise ValueError(f"Run {run_id} not found")
+            if not ai_run:
+                raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
 
-        # Preserve existing structure, update both brands and confirmed_brands
-        current = run.confirmed_competitors or {}
+            # Validate competitors list
+            if competitors is None:
+                competitors = []
 
-        # Update brands list (highest priority in context_loader)
-        current["brands"] = competitors
+            # Filter out empty strings and None values
+            competitors = [c for c in competitors if c and isinstance(c, str)]
 
-        # Also update confirmed_brands for consistency
-        current["confirmed_brands"] = competitors
-        current["confirmed_count"] = len(competitors)
+            # Update confirmedCompetitors array - MUST use flag_modified for ARRAY columns
+            ai_run.confirmedCompetitors = competitors
+            flag_modified(ai_run, 'confirmedCompetitors')
 
-        run.confirmed_competitors = current
+            await self.session.flush()
+            logger.info(f"Updated competitors for run {run_id}: {len(competitors)} competitors")
 
-        # Flag the JSON column as modified (SQLAlchemy doesn't detect in-place dict changes)
-        flag_modified(run, 'confirmed_competitors')
-
-        await self.session.flush()
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating competitors for run {run_id}: {e}")
+            raise Exception(f"Failed to update competitors: {str(e)}")

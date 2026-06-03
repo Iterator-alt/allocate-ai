@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Stage 1 Debug Mode - saves intermediate results to /debug_output
-    stage1_debug_mode: bool = False
+    stage1_debug_mode: bool = True
 
     # Rate Limiting
     rate_limit_generations_per_hour: int = 20
@@ -41,11 +41,12 @@ class Settings(BaseSettings):
 
     # Chat Agent Configuration
     chat_rerun_creates_new: bool = True  # True=create new run on rerun, False=update existing
+    chat_agent_mode: bool = True  # True=full agent mode (tools active), False=simple mode (Q&A only)
 
     # Competitor Confirmation Bypass
     # When True, auto-approve all competitors after Stage 1 and proceed directly to Stage 2
-    # When False, wait for user to confirm competitors via POST /runs/competitors/confirm
-    bypass_competitor_confirmation: bool = True
+    # When False, wait for user to confirm competitors via POST /runs/{id}/competitors/confirm
+    bypass_competitor_confirmation: bool = False
 
     @property
     def is_production(self) -> bool:

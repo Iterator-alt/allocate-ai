@@ -18,11 +18,18 @@ logger = logging.getLogger(__name__)
 class IntentType(str, Enum):
     """Types of intents the agent can detect."""
 
+    # Full agent mode intents
     COMPETITOR_ADD = "competitor_add"
     COMPETITOR_REMOVE = "competitor_remove"
     EDIT_INPUT = "edit_input"
     RERUN = "rerun"
     UNKNOWN = "unknown"
+
+    # Simple mode intents
+    QUESTION = "question"  # General question about allocation result
+    BLOCKED_EDIT = "blocked_edit"  # Tried to edit definition area fields
+    BLOCKED_COMPETITOR = "blocked_competitor"  # Tried to change competitors
+    BLOCKED_RERUN = "blocked_rerun"  # Tried to trigger rerun
 
 
 @dataclass
@@ -176,4 +183,79 @@ User message: {message}"""
                 intents=[IntentType.UNKNOWN],
                 confidence=0.0,
                 raw_response=str(e),
+            )
+
+    async def classify_simple_mode(
+        self,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> IntentClassificationResult:
+        """Classify intent in simple mode (Q&A only, no modifications allowed).
+
+        In simple mode:
+        - Questions about the result -> QUESTION
+        - Edit attempts (budget, KPI, channels, goal, customer, industry) -> BLOCKED_EDIT
+        - Competitor changes -> BLOCKED_COMPETITOR
+        - Rerun requests -> BLOCKED_RERUN
+        - Everything else -> QUESTION (default to answering)
+
+        Args:
+            message: The user's message text
+            context: Optional context about current state
+
+        Returns:
+            IntentClassificationResult with simple mode intent
+        """
+        # First, use normal classification to detect what user is trying to do
+        result = await self.classify(message, context)
+
+        if not result.intents:
+            return IntentClassificationResult(
+                intents=[IntentType.QUESTION],
+                confidence=1.0,
+                raw_response=result.raw_response,
+            )
+
+        original_intent = result.intents[0]
+
+        # Map full mode intents to simple mode intents
+        if original_intent == IntentType.COMPETITOR_ADD:
+            return IntentClassificationResult(
+                intents=[IntentType.BLOCKED_COMPETITOR],
+                entities=result.entities,
+                confidence=result.confidence,
+                raw_response=result.raw_response,
+            )
+
+        elif original_intent == IntentType.COMPETITOR_REMOVE:
+            return IntentClassificationResult(
+                intents=[IntentType.BLOCKED_COMPETITOR],
+                entities=result.entities,
+                confidence=result.confidence,
+                raw_response=result.raw_response,
+            )
+
+        elif original_intent == IntentType.EDIT_INPUT:
+            return IntentClassificationResult(
+                intents=[IntentType.BLOCKED_EDIT],
+                entities=result.entities,
+                confidence=result.confidence,
+                raw_response=result.raw_response,
+            )
+
+        elif original_intent == IntentType.RERUN:
+            return IntentClassificationResult(
+                intents=[IntentType.BLOCKED_RERUN],
+                entities=result.entities,
+                confidence=result.confidence,
+                raw_response=result.raw_response,
+            )
+
+        else:
+            # UNKNOWN or anything else -> treat as question
+            return IntentClassificationResult(
+                intents=[IntentType.QUESTION],
+                entities=result.entities,
+                confidence=result.confidence,
+                raw_response=result.raw_response,
             )

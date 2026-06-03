@@ -2,6 +2,9 @@
 
 Processes user messages, routes to appropriate tools, and generates responses.
 Maintains context of project state, run history, and chat history.
+
+PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun.chatSnapshot for chat storage
+instead of Python ChatHistory table.
 """
 
 import json
@@ -10,17 +13,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Union
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from fastapi import BackgroundTasks
 
+from src.db.models.prisma_tables import PrismaProjectVersionAiRun
 from src.services.chat.intent_classifier import IntentClassifier, IntentType, IntentClassificationResult
 from src.services.chat.tools.context_loader import ContextLoaderTool, ChatContext
 from src.services.chat.tools.competitor_tool import CompetitorManagementTool, CompetitorResult
 from src.services.chat.tools.editing_tool import InteractiveEditingTool, EditResult
 from src.services.chat.tools.rerun_tool import RerunTool, RerunResult
+from src.services.chat.tools.question_tool import QuestionAnswerTool, QuestionResult
 from src.services.llm_gateway.client import OpenAIClient
-from src.repositories.run import ChatHistoryRepository
 from src.services.stage1.debug_output import is_debug_mode, _save_debug_file
+from src.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +44,7 @@ class AgentResponse:
     rerun_blocked_reason: Optional[str] = None
     chat_message_id: int = 0
     new_run_id: Optional[int] = None
-    new_version_name: Optional[str] = None  # e.g., "v2", "v3"
+    new_version_name: Optional[str] = None
     pending_changes: Optional[List[Dict[str, Any]]] = None
 
 
@@ -60,8 +67,10 @@ class ChatAgent:
     2. Classify intent(s)
     3. Execute FIRST intent only (ignore rest)
     4. Generate response
-    5. Save to chat history with extra_data
+    5. Save to chat history (chatSnapshot in ProjectVersionAiRun)
     6. Return structured response
+
+    PRISMA-ONLY MODE: Uses PrismaProjectVersionAiRun.chatSnapshot for storage.
     """
 
     def __init__(
@@ -78,23 +87,26 @@ class ChatAgent:
         self.competitor_tool = CompetitorManagementTool(session)
         self.editing_tool = InteractiveEditingTool(session)
         self.rerun_tool = RerunTool(session, background_tasks)
-        self.chat_repo = ChatHistoryRepository(session)
+        self.question_tool = QuestionAnswerTool()  # For simple mode Q&A
         self.llm_client = OpenAIClient()
+        self.settings = get_settings()
 
     async def process_message(
         self,
-        project_id: int,
+        project_id: Optional[str],
         run_id: int,
         message: str,
-        version_id: Optional[int] = None,
+        version_id: Optional[str] = None,
     ) -> AgentResponse:
         """Process a user message and return agent response.
 
+        Routes to full agent mode or simple mode based on config flag.
+
         Args:
-            project_id: Project ID
-            run_id: Run ID
+            project_id: Project ID (not used in Prisma mode)
+            run_id: externalRunId from ProjectVersionAiRun
             message: User's message text
-            version_id: Optional project version ID
+            version_id: Optional project version ID (not used)
 
         Returns:
             AgentResponse with response text and metadata
@@ -103,13 +115,14 @@ class ChatAgent:
         debug_run_id = str(run_id) if is_debug_mode() else None
 
         try:
-            # 1. Load context (Tool 0)
+            # 1. Load context (Tool 0) - always needed
             context = await self.context_loader.load(run_id, project_id)
 
             if debug_run_id:
                 _save_debug_file(debug_run_id, "C0_context_loaded", {
                     "run_id": run_id,
-                    "project_id": project_id,
+                    "ai_run_id": context.ai_run_id,
+                    "mode": "full_agent" if self.settings.chat_agent_mode else "simple",
                     "context": {
                         "run_status": context.run_status,
                         "has_results": context.has_results,
@@ -124,86 +137,11 @@ class ChatAgent:
                     },
                 })
 
-            # 2. Classify intent(s)
-            classification = await self.intent_classifier.classify(
-                message=message,
-                context={
-                    "current_competitors": context.current_competitors,
-                    "customer_name": context.customer_name,
-                    "industry": context.industry,
-                    "brand_kpi": context.brand_kpi,
-                    "total_budget": context.total_budget,
-                    "channels": context.channels,
-                },
-            )
-
-            if debug_run_id:
-                _save_debug_file(debug_run_id, "C1_intent_classification", {
-                    "message": message,
-                    "intents": [i.value for i in classification.intents],
-                    "entities": {
-                        k: [{"type": e.type, "value": e.value} for e in v]
-                        for k, v in classification.entities.items()
-                    },
-                    "confidence": classification.confidence,
-                    "raw_response": classification.raw_response,
-                })
-
-            # 3. Execute FIRST intent only
-            first_intent = classification.intents[0] if classification.intents else IntentType.UNKNOWN
-            result = await self._execute_tool(first_intent, classification, context, run_id)
-
-            if debug_run_id:
-                _save_debug_file(debug_run_id, "C2_tool_execution", {
-                    "intent": first_intent.value,
-                    "result": self._serialize_result(result),
-                })
-
-            # 4. Generate response
-            response_text = await self._generate_response(
-                message=message,
-                intent=first_intent,
-                result=result,
-                context=context,
-            )
-
-            if debug_run_id:
-                _save_debug_file(debug_run_id, "C3_response_generation", {
-                    "response_text": response_text,
-                })
-
-            # 5. Save messages to chat history
-            change_record = self._extract_change_record(result)
-            user_msg_id = await self._save_user_message(run_id, message)
-
-            # Determine tool_used - for rerun, only mark as "rerun" if it was actually triggered
-            # This prevents false rerun markers from clearing pending changes in future context loads
-            tool_used = None
-            if first_intent != IntentType.UNKNOWN:
-                if first_intent == IntentType.RERUN:
-                    # Only mark as rerun if it actually succeeded
-                    if isinstance(result, RerunResult) and result.rerun_triggered:
-                        tool_used = first_intent.value
-                    # If rerun failed (no changes), don't store "rerun" as tool_used
-                else:
-                    tool_used = first_intent.value
-
-            agent_msg_id = await self._save_agent_message(
-                run_id=run_id,
-                response_text=response_text,
-                tool_used=tool_used,
-                change_record=change_record,
-            )
-
-            # 6. Build and return response
-            return self._build_response(
-                response_text=response_text,
-                intent=first_intent,
-                result=result,
-                chat_message_id=agent_msg_id,
-                context=context,
-                change_record=change_record,
-            )
+            # Route based on chat_agent_mode
+            if self.settings.chat_agent_mode:
+                return await self._process_full_mode(context, run_id, message, debug_run_id)
+            else:
+                return await self._process_simple_mode(context, run_id, message, debug_run_id)
 
         except Exception as e:
             logger.error(f"Error processing message for run {run_id}: {str(e)}")
@@ -226,6 +164,172 @@ class ChatAgent:
                 chat_message_id=agent_msg_id,
             )
 
+    async def _process_full_mode(
+        self,
+        context: ChatContext,
+        run_id: int,
+        message: str,
+        debug_run_id: Optional[str],
+    ) -> AgentResponse:
+        """Process message in full agent mode (all tools active).
+
+        Full agent mode allows:
+        - Adding/removing competitors
+        - Editing inputs (budget, KPI, channels, etc.)
+        - Triggering reruns
+        """
+        # 2. Classify intent(s)
+        classification = await self.intent_classifier.classify(
+            message=message,
+            context={
+                "current_competitors": context.current_competitors,
+                "customer_name": context.customer_name,
+                "industry": context.industry,
+                "brand_kpi": context.brand_kpi,
+                "total_budget": context.total_budget,
+                "channels": context.channels,
+            },
+        )
+
+        if debug_run_id:
+            _save_debug_file(debug_run_id, "C1_intent_classification", {
+                "mode": "full_agent",
+                "message": message,
+                "intents": [i.value for i in classification.intents],
+                "entities": {
+                    k: [{"type": e.type, "value": e.value} for e in v]
+                    for k, v in classification.entities.items()
+                },
+                "confidence": classification.confidence,
+                "raw_response": classification.raw_response,
+            })
+
+        # 3. Execute FIRST intent only
+        first_intent = classification.intents[0] if classification.intents else IntentType.UNKNOWN
+        result = await self._execute_tool(first_intent, classification, context, run_id)
+
+        if debug_run_id:
+            _save_debug_file(debug_run_id, "C2_tool_execution", {
+                "intent": first_intent.value,
+                "result": self._serialize_result(result),
+            })
+
+        # 4. Generate response
+        response_text = await self._generate_response(
+            message=message,
+            intent=first_intent,
+            result=result,
+            context=context,
+        )
+
+        if debug_run_id:
+            _save_debug_file(debug_run_id, "C3_response_generation", {
+                "response_text": response_text,
+            })
+
+        # 5. Save messages to chatSnapshot
+        change_record = self._extract_change_record(result)
+        user_msg_id = await self._save_user_message(run_id, message)
+
+        # Determine tool_used - for rerun, only mark as "rerun" if it was actually triggered
+        tool_used = None
+        if first_intent != IntentType.UNKNOWN:
+            if first_intent == IntentType.RERUN:
+                if isinstance(result, RerunResult) and result.rerun_triggered:
+                    tool_used = first_intent.value
+            else:
+                tool_used = first_intent.value
+
+        agent_msg_id = await self._save_agent_message(
+            run_id=run_id,
+            response_text=response_text,
+            tool_used=tool_used,
+            change_record=change_record,
+        )
+
+        # 6. Build and return response
+        return self._build_response(
+            response_text=response_text,
+            intent=first_intent,
+            result=result,
+            chat_message_id=agent_msg_id,
+            context=context,
+            change_record=change_record,
+        )
+
+    async def _process_simple_mode(
+        self,
+        context: ChatContext,
+        run_id: int,
+        message: str,
+        debug_run_id: Optional[str],
+    ) -> AgentResponse:
+        """Process message in simple mode (Q&A only, no modifications).
+
+        Simple mode:
+        - Answers questions about the allocation result
+        - Blocks edit attempts -> redirects to Definition Area
+        - Blocks competitor changes -> redirects to competitor confirmation
+        - Blocks rerun -> redirects to Generate button
+        """
+        # Classify intent using simple mode classifier
+        classification = await self.intent_classifier.classify_simple_mode(
+            message=message,
+            context={
+                "current_competitors": context.current_competitors,
+                "customer_name": context.customer_name,
+                "industry": context.industry,
+                "brand_kpi": context.brand_kpi,
+                "total_budget": context.total_budget,
+                "channels": context.channels,
+            },
+        )
+
+        first_intent = classification.intents[0] if classification.intents else IntentType.QUESTION
+
+        if debug_run_id:
+            _save_debug_file(debug_run_id, "C1_intent_classification", {
+                "mode": "simple",
+                "message": message,
+                "intents": [i.value for i in classification.intents],
+                "confidence": classification.confidence,
+                "raw_response": classification.raw_response,
+            })
+
+        # Handle blocked intents with redirect messages
+        if first_intent == IntentType.BLOCKED_EDIT:
+            response_text = "Please update this in the Definition Area and click Generate to rerun the allocation."
+        elif first_intent == IntentType.BLOCKED_COMPETITOR:
+            response_text = "Please update your competitor selection in the competitor confirmation step and rerun from there."
+        elif first_intent == IntentType.BLOCKED_RERUN:
+            response_text = "Please click Generate in the Definition Area to rerun the allocation."
+        else:
+            # QUESTION or UNKNOWN - answer using QuestionAnswerTool
+            result = await self.question_tool.answer(run_id, message, context)
+            response_text = result.message
+
+        if debug_run_id:
+            _save_debug_file(debug_run_id, "C2_simple_mode_response", {
+                "intent": first_intent.value,
+                "response_text": response_text,
+            })
+
+        # Save messages to chatSnapshot
+        await self._save_user_message(run_id, message)
+        agent_msg_id = await self._save_agent_message(
+            run_id=run_id,
+            response_text=response_text,
+            tool_used=first_intent.value if first_intent != IntentType.QUESTION else "question",
+            change_record=None,  # No changes in simple mode
+        )
+
+        return AgentResponse(
+            response_text=response_text,
+            tool_used=first_intent.value if first_intent != IntentType.QUESTION else "question",
+            chat_message_id=agent_msg_id,
+            pending_changes=[],  # No pending changes in simple mode
+        )
+
     async def _execute_tool(
         self,
         intent: IntentType,
@@ -240,7 +344,6 @@ class ChatAgent:
         entities = classification.entities
 
         if intent == IntentType.COMPETITOR_ADD:
-            # Extract brand name from entities
             brands = entities.get("brands", [])
             if brands:
                 brand = brands[0].value
@@ -294,7 +397,6 @@ class ChatAgent:
             # Add reminder about generating if changes were made
             if hasattr(result, 'success') and result.success:
                 if intent in [IntentType.COMPETITOR_ADD, IntentType.COMPETITOR_REMOVE, IntentType.EDIT_INPUT]:
-                    # Don't add reminder if rerun was already triggered
                     if not (isinstance(result, RerunResult) and result.rerun_triggered):
                         base_message += "\n\nHit Generate to apply your changes."
 
@@ -302,9 +404,9 @@ class ChatAgent:
 
         # Unknown intent - ask for clarification
         if intent == IntentType.UNKNOWN:
-            return "I didn't quite get that — are you trying to change an input, add or remove a competitor, or rerun the allocation?"
+            return "I didn't quite get that - are you trying to change an input, add or remove a competitor, or rerun the allocation?"
 
-        # Fallback - shouldn't happen
+        # Fallback
         return "I processed your request but couldn't determine the outcome. Please try again."
 
     async def _save_user_message(
@@ -312,20 +414,17 @@ class ChatAgent:
         run_id: int,
         message: str,
     ) -> int:
-        """Save user message to chat history."""
-        chat_msg = await self.chat_repo.create_message(
-            run_id=run_id,
-            message_type="chat",
-            severity="info",
-            title="User",
-            content=message,
-            extra_data={
-                "role": "user",
-                "tool_used": None,
-                "changes_made": [],
-            },
-        )
-        return chat_msg.id
+        """Save user message to chatSnapshot."""
+        msg_data = {
+            "role": "user",
+            "content": message,
+            "tool_used": None,
+            "changes_made": [],
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+        msg_id = await self._append_to_chat_snapshot(run_id, msg_data)
+        return msg_id
 
     async def _save_agent_message(
         self,
@@ -334,22 +433,59 @@ class ChatAgent:
         tool_used: Optional[str],
         change_record: Optional[Dict[str, Any]],
     ) -> int:
-        """Save agent message to chat history."""
+        """Save agent message to chatSnapshot."""
         changes_made = [change_record] if change_record else []
 
-        chat_msg = await self.chat_repo.create_message(
-            run_id=run_id,
-            message_type="chat",
-            severity="info",
-            title="Agent",
-            content=response_text,
-            extra_data={
-                "role": "agent",
-                "tool_used": tool_used,
-                "changes_made": changes_made,
-            },
+        msg_data = {
+            "role": "agent",
+            "content": response_text,
+            "tool_used": tool_used,
+            "changes_made": changes_made,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+        msg_id = await self._append_to_chat_snapshot(run_id, msg_data)
+        return msg_id
+
+    async def _append_to_chat_snapshot(
+        self,
+        run_id: int,
+        msg_data: Dict[str, Any],
+    ) -> int:
+        """Append a message to ProjectVersionAiRun.chatSnapshot.
+
+        Returns the message ID (index in the messages array).
+        """
+        query = select(PrismaProjectVersionAiRun).where(
+            PrismaProjectVersionAiRun.externalRunId == run_id
         )
-        return chat_msg.id
+        result = await self.session.execute(query)
+        ai_run = result.scalar_one_or_none()
+
+        if not ai_run:
+            raise ValueError(f"ProjectVersionAiRun with externalRunId {run_id} not found")
+
+        # Get or initialize chatSnapshot
+        chat_snapshot = ai_run.chatSnapshot or {"messages": []}
+
+        # Assign message ID
+        messages = chat_snapshot.get("messages", [])
+        msg_id = len(messages)
+        msg_data["id"] = msg_id
+
+        # Append message
+        messages.append(msg_data)
+        chat_snapshot["messages"] = messages
+        chat_snapshot["updated_at"] = datetime.utcnow().isoformat()
+
+        # Update the AI run - MUST use flag_modified for JSONB columns
+        ai_run.chatSnapshot = chat_snapshot
+        ai_run.updatedAt = datetime.utcnow()
+        flag_modified(ai_run, 'chatSnapshot')
+
+        await self.session.flush()
+
+        return msg_id
 
     def _extract_change_record(
         self,

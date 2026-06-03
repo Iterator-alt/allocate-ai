@@ -15,7 +15,6 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.repositories import (
-    IndustryMapRepository,
     NielsenRepository,
     YouGovRepository,
 )
@@ -70,7 +69,6 @@ class DataFeasibilityGuard:
 
     def __init__(self, session: AsyncSession):
         self.session = session
-        self.industry_repo = IndustryMapRepository(session)
         self.nielsen_repo = NielsenRepository(session)
         self.yougov_repo = YouGovRepository(session)
 
@@ -137,21 +135,27 @@ class DataFeasibilityGuard:
         )
 
     async def _check_industry(self, industry: str) -> Optional[FeasibilityIssue]:
-        """Check if industry exists in mapping table."""
-        sector_label = await self.industry_repo.get_sector_label(industry)
+        """Check if industry exists in Nielsen data.
 
-        if sector_label:
-            return None
+        PRISMA-ONLY MODE: No industry_map table, check Nielsen directly.
+        """
+        # Get all industries from Nielsen
+        all_industries = await self.nielsen_repo.get_wirtschaftsgruppen()
+
+        # Check if industry exists (case-insensitive)
+        industry_lower = industry.lower()
+        for ind in all_industries:
+            if ind.lower() == industry_lower:
+                return None  # Found exact match
 
         # Find similar industries for suggestions
-        all_industries = await self.industry_repo.get_all_wirtschaftsgruppen()
         suggestions = self._find_similar_strings(industry, all_industries, limit=5)
 
         return FeasibilityIssue(
             field="industry",
             value=industry,
             issue_type="not_found",
-            message=f"Industry '{industry}' not found in mapping table",
+            message=f"Industry '{industry}' not found in Nielsen data",
             suggestions=suggestions,
             is_blocking=True,
         )
@@ -200,13 +204,14 @@ class DataFeasibilityGuard:
         brand_kpi: str,
         require_full_data: bool,
     ) -> List[str]:
-        """Check data availability and return warnings."""
+        """Check data availability and return warnings.
+
+        PRISMA-ONLY MODE: No industry_map table, use industry as sector directly.
+        """
         warnings = []
 
-        # Get sector label for YouGov check
-        sector_label = await self.industry_repo.get_sector_label(industry)
-        if not sector_label:
-            return warnings
+        # PRISMA-ONLY MODE: Use industry name as sector_label directly
+        sector_label = industry
 
         # Check Nielsen data
         nielsen_brands = await self.nielsen_repo.get_brands_in_industry(industry)
@@ -289,8 +294,10 @@ class DataFeasibilityGuard:
         """Get all available options for industries, channels, and KPIs.
 
         Useful for frontend dropdown population.
+
+        PRISMA-ONLY MODE: Get industries from Nielsen directly.
         """
-        industries = await self.industry_repo.get_all_wirtschaftsgruppen()
+        industries = await self.nielsen_repo.get_wirtschaftsgruppen()
         channels = await self.nielsen_repo.get_channels()
         sectors = await self.yougov_repo.get_sectors()
 
