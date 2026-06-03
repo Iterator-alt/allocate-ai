@@ -55,6 +55,9 @@ class ChatContext:
     # Last result summary
     last_result_summary: Optional[str] = None
 
+    # Full allocation result for Q&A
+    allocation_result: Optional[Dict[str, Any]] = None
+
     # Pending changes since last rerun
     pending_changes: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -160,6 +163,7 @@ class ContextLoaderTool:
             version_name=project_version.versionName,
             version_number=project_version.versionNumber,
             last_result_summary=result_summary,
+            allocation_result=ai_run.allocationResult,
             pending_changes=pending_changes,
         )
 

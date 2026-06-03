@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status, Backgrou
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from src.dependencies import get_db
 from src.api.schemas import (
@@ -238,6 +239,82 @@ def extract_campaign_inputs(project_version: PrismaProjectVersion) -> CampaignIn
     )
 
 
+def should_skip_stage1(
+    current_inputs: CampaignInputs,
+    ai_run: PrismaProjectVersionAiRun,
+) -> bool:
+    """Determine if Stage 1 can be skipped based on what changed.
+
+    Stage 1 can be skipped if ONLY these fields changed:
+    - goal_text
+    - total_budget
+    - brand_kpi
+    - direction
+    - mediaChannels
+
+    Stage 1 MUST run if ANY of these changed:
+    - customer_name
+    - industry
+    - confirmedCompetitors
+
+    Also requires existing competitorSnapshot and confirmedCompetitors from a previous run.
+
+    Returns:
+        True if Stage 1 can be skipped, False otherwise
+    """
+    # Must have existing competitor data to skip Stage 1
+    if not ai_run.competitorSnapshot:
+        logger.info("Stage 1 required: No existing competitorSnapshot")
+        return False
+
+    if not ai_run.confirmedCompetitors:
+        logger.info("Stage 1 required: No existing confirmedCompetitors")
+        return False
+
+    # Get last run inputs from rawPayload if stored, otherwise we need Stage 1
+    last_inputs = ai_run.rawPayload.get("last_inputs") if ai_run.rawPayload else None
+
+    if not last_inputs:
+        # First run or no cached inputs - must run Stage 1
+        logger.info("Stage 1 required: No cached last_inputs in rawPayload")
+        return False
+
+    # Check fields that REQUIRE Stage 1 if changed
+    if current_inputs.customer_name != last_inputs.get("customer_name"):
+        logger.info(f"Stage 1 required: customer_name changed from '{last_inputs.get('customer_name')}' to '{current_inputs.customer_name}'")
+        return False
+
+    if current_inputs.industry != last_inputs.get("industry"):
+        logger.info(f"Stage 1 required: industry changed from '{last_inputs.get('industry')}' to '{current_inputs.industry}'")
+        return False
+
+    # If we get here, only preference fields changed - can skip Stage 1
+    logger.info("Stage 1 can be skipped: Only preference fields changed")
+    return True
+
+
+def save_inputs_to_raw_payload(
+    ai_run: PrismaProjectVersionAiRun,
+    inputs: CampaignInputs,
+) -> None:
+    """Save current inputs to rawPayload for future skip detection."""
+    if ai_run.rawPayload is None:
+        ai_run.rawPayload = {}
+
+    ai_run.rawPayload["last_inputs"] = {
+        "customer_name": inputs.customer_name,
+        "industry": inputs.industry,
+        "brand_kpi": inputs.brand_kpi,
+        "goal_text": inputs.goal_text,
+        "total_budget": inputs.total_budget,
+        "direction": inputs.direction,
+        "media_channels": inputs.media_channels,
+    }
+
+    # Mark JSONB column as modified for SQLAlchemy to detect the change
+    flag_modified(ai_run, 'rawPayload')
+
+
 # =============================================================================
 # Background Task: Full Pipeline Processing
 # =============================================================================
@@ -255,7 +332,17 @@ async def run_full_pipeline_background(
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
     from sqlalchemy.orm import sessionmaker
 
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(
+        db_url,
+        pool_recycle=90,
+        connect_args={
+            "server_settings": {
+                "tcp_keepalives_idle": "30",
+                "tcp_keepalives_interval": "10",
+                "tcp_keepalives_count": "5",
+            }
+        },
+    )
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as session:
@@ -314,7 +401,19 @@ async def run_full_pipeline_background(
 
             competitor_snapshot = _build_competitor_snapshot(stage1_result, inputs.industry)
 
+            # Validate that we have competitors before proceeding
+            snapshot_competitors = competitor_snapshot.get("competitors", []) if competitor_snapshot else []
+            if not snapshot_competitors:
+                error_msg = "Stage 1 failed: No competitors found for the given brand and industry"
+                logger.error(f"[ExternalRunId {external_run_id}] {error_msg}")
+                await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                return
+
             ai_run.competitorSnapshot = competitor_snapshot
+
+            # Save inputs for future skip detection
+            save_inputs_to_raw_payload(ai_run, inputs)
+
             await session.commit()
 
             logger.info(f"[ExternalRunId {external_run_id}] Stage 1 completed: {len(yougov_brands)} YouGov brands, {len(nielsen_brands)} Nielsen brands")
@@ -728,7 +827,17 @@ async def _run_stages_2_to_4_pipeline(
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
     from sqlalchemy.orm import sessionmaker
 
-    engine = create_async_engine(db_url)
+    engine = create_async_engine(
+        db_url,
+        pool_recycle=90,
+        connect_args={
+            "server_settings": {
+                "tcp_keepalives_idle": "30",
+                "tcp_keepalives_interval": "10",
+                "tcp_keepalives_count": "5",
+            }
+        },
+    )
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as session:
@@ -1118,23 +1227,69 @@ async def create_run(
             detail=f"ProjectVersion {ai_run.projectVersionId} not found",
         )
 
-    # Update ProjectVersionAiRun to pending status
-    ai_run.status = "pending"
-    ai_run.progressPct = 0
-    ai_run.stage = None
-    ai_run.errorMessage = None
-    ai_run.updatedAt = datetime.utcnow()
-    await db.commit()
+    # Extract campaign inputs
+    inputs = extract_campaign_inputs(project_version)
 
-    # Start full pipeline in background
-    background_tasks.add_task(
-        run_full_pipeline_background,
-        external_run_id=external_run_id,
-        prisma_ai_run_id=ai_run.id,
-        db_url=settings.database_url,
-    )
+    # Check if Stage 1 can be skipped
+    can_skip_stage1 = should_skip_stage1(inputs, ai_run)
 
-    logger.info(f"Run started for externalRunId={external_run_id}, ProjectVersionAiRun={ai_run.id}")
+    if can_skip_stage1:
+        # Stage 1 SKIP: Only preference fields changed
+        # Preserve: competitorSnapshot, confirmedCompetitors, chatSnapshot
+        # Clear: allocationResult
+        logger.info(f"[ExternalRunId {external_run_id}] Skipping Stage 1 - only preference fields changed")
+
+        ai_run.status = "pending"
+        ai_run.progressPct = 0
+        ai_run.stage = None
+        ai_run.errorMessage = None
+        ai_run.allocationResult = None  # Clear old result
+        # Preserve: competitorSnapshot, confirmedCompetitors, chatSnapshot
+        ai_run.updatedAt = datetime.utcnow()
+
+        # Save current inputs for future skip detection
+        save_inputs_to_raw_payload(ai_run, inputs)
+        await db.commit()
+
+        # Start Stage 2-4 only pipeline in background
+        background_tasks.add_task(
+            _run_stages_2_to_4_pipeline,
+            prisma_ai_run_id=ai_run.id,
+            external_run_id=external_run_id,
+            db_url=settings.database_url,
+        )
+
+        logger.info(f"Run started (Stage 2-4 only) for externalRunId={external_run_id}")
+
+    else:
+        # Stage 1 REQUIRED: Customer/industry/competitors changed
+        # Clear: allocationResult, competitorSnapshot, confirmedCompetitors
+        # Preserve: chatSnapshot
+        logger.info(f"[ExternalRunId {external_run_id}] Running full Stage 1-4 pipeline")
+
+        ai_run.status = "pending"
+        ai_run.progressPct = 0
+        ai_run.stage = None
+        ai_run.errorMessage = None
+        ai_run.allocationResult = None  # Clear old result
+        ai_run.competitorSnapshot = None  # Clear - will be regenerated
+        ai_run.confirmedCompetitors = None  # Clear - will need re-confirmation
+        # Preserve: chatSnapshot
+        ai_run.updatedAt = datetime.utcnow()
+
+        # Save current inputs for future skip detection
+        save_inputs_to_raw_payload(ai_run, inputs)
+        await db.commit()
+
+        # Start full pipeline in background
+        background_tasks.add_task(
+            run_full_pipeline_background,
+            external_run_id=external_run_id,
+            prisma_ai_run_id=ai_run.id,
+            db_url=settings.database_url,
+        )
+
+        logger.info(f"Run started (full Stage 1-4) for externalRunId={external_run_id}")
 
     return StartRunResponse(
         run_id=external_run_id,

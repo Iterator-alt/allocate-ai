@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     # Chat Agent Configuration
     chat_rerun_creates_new: bool = True  # True=create new run on rerun, False=update existing
+    chat_agent_mode: bool = True  # True=full agent mode (tools active), False=simple mode (Q&A only)
 
     # Competitor Confirmation Bypass
     # When True, auto-approve all competitors after Stage 1 and proceed directly to Stage 2

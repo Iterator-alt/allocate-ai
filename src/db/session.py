@@ -10,9 +10,16 @@ settings = get_settings()
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
-    pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
+    pool_recycle=90,  # Recycle connections every 90 seconds to prevent stale connections
+    connect_args={
+        "server_settings": {
+            "tcp_keepalives_idle": "30",      # Start keepalive after 30s idle
+            "tcp_keepalives_interval": "10",  # Send keepalive every 10s
+            "tcp_keepalives_count": "5",      # Fail after 5 missed keepalives
+        }
+    },
 )
 
 # Session factory
