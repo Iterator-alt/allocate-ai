@@ -322,30 +322,16 @@ def save_inputs_to_raw_payload(
 async def run_full_pipeline_background(
     external_run_id: int,
     prisma_ai_run_id: str,
-    db_url: str,
 ):
     """Background task to run the full Stage 1-4 pipeline.
 
     This runs asynchronously after POST /runs returns.
     All state is stored in ProjectVersionAiRun.
+    Uses shared connection pool from src/db/session.py.
     """
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-    from sqlalchemy.orm import sessionmaker
+    from src.db.session import AsyncSessionLocal
 
-    engine = create_async_engine(
-        db_url,
-        pool_recycle=90,
-        connect_args={
-            "server_settings": {
-                "tcp_keepalives_idle": "30",
-                "tcp_keepalives_interval": "10",
-                "tcp_keepalives_count": "5",
-            }
-        },
-    )
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-    async with async_session() as session:
+    async with AsyncSessionLocal() as session:
         try:
             # Get the AI run record
             query = select(PrismaProjectVersionAiRun).where(
@@ -817,30 +803,16 @@ def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
 async def _run_stages_2_to_4_pipeline(
     prisma_ai_run_id: str,
     external_run_id: int,
-    db_url: str,
 ):
     """Run Stages 2-4 after competitor confirmation.
 
     This is called from the confirm endpoint after user approves competitors.
     Stage 1 data is read from competitorSnapshot in the database.
+    Uses shared connection pool from src/db/session.py.
     """
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-    from sqlalchemy.orm import sessionmaker
+    from src.db.session import AsyncSessionLocal
 
-    engine = create_async_engine(
-        db_url,
-        pool_recycle=90,
-        connect_args={
-            "server_settings": {
-                "tcp_keepalives_idle": "30",
-                "tcp_keepalives_interval": "10",
-                "tcp_keepalives_count": "5",
-            }
-        },
-    )
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-    async with async_session() as session:
+    async with AsyncSessionLocal() as session:
         try:
             # Get the AI run record
             query = select(PrismaProjectVersionAiRun).where(
@@ -1256,7 +1228,6 @@ async def create_run(
             _run_stages_2_to_4_pipeline,
             prisma_ai_run_id=ai_run.id,
             external_run_id=external_run_id,
-            db_url=settings.database_url,
         )
 
         logger.info(f"Run started (Stage 2-4 only) for externalRunId={external_run_id}")
@@ -1286,7 +1257,6 @@ async def create_run(
             run_full_pipeline_background,
             external_run_id=external_run_id,
             prisma_ai_run_id=ai_run.id,
-            db_url=settings.database_url,
         )
 
         logger.info(f"Run started (full Stage 1-4) for externalRunId={external_run_id}")
@@ -1344,25 +1314,30 @@ async def get_run_status(
     # Generate human-readable progress message
     progress_messages = {
         "pending": "Queued for processing",
-        "matching": "Finding competitor brands (Stage 1)...",
+        "matching": "Finding competitor brands...",
         "awaiting_confirmation": "Waiting for competitor confirmation...",
-        "generating": "Generating allocation with AI (Stage 2)...",
-        "parsing": "Processing results (Stage 3)...",
-        "completing": "Finalizing results (Stage 4)...",
+        "generating": "Generating allocation with AI...",
+        "parsing": "Processing results...",
+        "completing": "Finalizing results...",
         "completed": "Completed",
         "failed": "Failed",
         "cancelled": "Cancelled",
     }
 
+    # Determine the effective status - handle None/missing status
+    effective_status = ai_run.status or "pending"
+    mapped_status = status_map.get(effective_status, RunStatus.PENDING)
+    progress_message = progress_messages.get(effective_status, "Processing...")
+
     return RunStatusResponse(
         id=run_id,
-        status=status_map.get(ai_run.status, RunStatus.PENDING),
+        status=mapped_status,
         stage=ai_run.stage,
         progress_pct=ai_run.progressPct or 0,
         started_at=ai_run.startedAt,
         completed_at=ai_run.completedAt,
         error_message=ai_run.errorMessage,
-        progress=progress_messages.get(ai_run.status, "Processing..."),
+        progress=progress_message,
     )
 
 

@@ -32,14 +32,20 @@ router = APIRouter(prefix="/runs", tags=["competitors"])
 # Response Schemas
 # =============================================================================
 
-class CompetitorSearchResponse(BaseModel):
-    """Response from competitor search."""
-    found: bool = Field(..., description="Whether the brand was found")
-    source: Optional[str] = Field(None, description="Where found: 'snapshot' or 'database'")
-    brand: Optional[str] = Field(None, description="Canonical brand name if found")
+class CompetitorSearchResult(BaseModel):
+    """A single competitor search result."""
+    source: str = Field(..., description="Where found: 'snapshot' or 'database'")
+    brand: str = Field(..., description="Canonical brand name")
     has_yougov_data: bool = Field(False, description="Whether YouGov data exists")
     has_nielsen_data: bool = Field(False, description="Whether Nielsen data exists")
     warning: Optional[str] = Field(None, description="Warning message if any")
+
+
+class CompetitorSearchResponse(BaseModel):
+    """Response from competitor search."""
+    found: bool = Field(..., description="Whether any brands were found")
+    results: List[CompetitorSearchResult] = Field(default_factory=list, description="List of matching brands")
+    warning: Optional[str] = Field(None, description="Warning message if not found")
 
 
 # =============================================================================
@@ -257,10 +263,13 @@ async def search_competitor(
     if snapshot_match:
         return CompetitorSearchResponse(
             found=True,
-            source="snapshot",
-            brand=snapshot_match.get("yougov_brand_label"),
-            has_yougov_data=snapshot_match.get("has_yougov_data", True),
-            has_nielsen_data=snapshot_match.get("has_nielsen_data", False),
+            results=[CompetitorSearchResult(
+                source="snapshot",
+                brand=snapshot_match.get("yougov_brand_label"),
+                has_yougov_data=snapshot_match.get("has_yougov_data", True),
+                has_nielsen_data=snapshot_match.get("has_nielsen_data", False),
+                warning=None,
+            )],
             warning=None,
         )
 
@@ -275,40 +284,46 @@ async def search_competitor(
         # Found in both
         return CompetitorSearchResponse(
             found=True,
-            source="database",
-            brand=yougov_brand,  # Use YouGov label as canonical
-            has_yougov_data=True,
-            has_nielsen_data=True,
+            results=[CompetitorSearchResult(
+                source="database",
+                brand=yougov_brand,  # Use YouGov label as canonical
+                has_yougov_data=True,
+                has_nielsen_data=True,
+                warning=None,
+            )],
             warning=None,
         )
     elif yougov_brand:
         # YouGov only
         return CompetitorSearchResponse(
             found=True,
-            source="database",
-            brand=yougov_brand,
-            has_yougov_data=True,
-            has_nielsen_data=False,
-            warning="No Nielsen spend data available for this brand.",
+            results=[CompetitorSearchResult(
+                source="database",
+                brand=yougov_brand,
+                has_yougov_data=True,
+                has_nielsen_data=False,
+                warning="No Nielsen spend data available for this brand.",
+            )],
+            warning=None,
         )
     elif nielsen_brand:
         # Nielsen only (rare case)
         return CompetitorSearchResponse(
             found=True,
-            source="database",
-            brand=nielsen_brand,
-            has_yougov_data=False,
-            has_nielsen_data=True,
-            warning="No YouGov perception data available for this brand.",
+            results=[CompetitorSearchResult(
+                source="database",
+                brand=nielsen_brand,
+                has_yougov_data=False,
+                has_nielsen_data=True,
+                warning="No YouGov perception data available for this brand.",
+            )],
+            warning=None,
         )
     else:
         # Not found anywhere
         return CompetitorSearchResponse(
             found=False,
-            source=None,
-            brand=None,
-            has_yougov_data=False,
-            has_nielsen_data=False,
+            results=[],
             warning="Brand not found in our database.",
         )
 
@@ -411,7 +426,6 @@ async def confirm_competitors(
         _run_stages_2_to_4_pipeline,
         prisma_ai_run_id=ai_run.id,
         external_run_id=run_id,
-        db_url=str(get_settings().database_url),
     )
 
     return ConfirmCompetitorsResponse(

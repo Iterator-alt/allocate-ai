@@ -12,24 +12,22 @@ engine = create_async_engine(
     echo=settings.debug,
     pool_size=5,
     max_overflow=10,
-    pool_recycle=90,  # Recycle connections every 90 seconds to prevent stale connections
-    connect_args={
-        "server_settings": {
-            "tcp_keepalives_idle": "30",      # Start keepalive after 30s idle
-            "tcp_keepalives_interval": "10",  # Send keepalive every 10s
-            "tcp_keepalives_count": "5",      # Fail after 5 missed keepalives
-        }
-    },
+    pool_timeout=10,
+    pool_recycle=90,
+    pool_pre_ping=True,
 )
 
-# Session factory
-async_session_factory = async_sessionmaker(
+# Session factory - used by FastAPI dependencies and background tasks
+AsyncSessionLocal = async_sessionmaker(
     engine,
     class_=AsyncSession,
     expire_on_commit=False,
     autocommit=False,
     autoflush=False,
 )
+
+# Alias for backward compatibility
+async_session_factory = AsyncSessionLocal
 
 
 async def get_async_session() -> AsyncSession:
