@@ -1202,14 +1202,22 @@ async def create_run(
     # Extract campaign inputs
     inputs = extract_campaign_inputs(project_version)
 
-    # Check if Stage 1 can be skipped
-    can_skip_stage1 = should_skip_stage1(inputs, ai_run)
+    # Determine if Stage 1 can be skipped
+    # Priority: frontend flag > auto-detection
+    if run_request.definition_changed is not None:
+        # Frontend explicitly told us
+        can_skip_stage1 = not run_request.definition_changed
+        skip_reason = "frontend flag" if can_skip_stage1 else "frontend flag (definition_changed=true)"
+    else:
+        # Fallback to auto-detection
+        can_skip_stage1 = should_skip_stage1(inputs, ai_run)
+        skip_reason = "auto-detection" if can_skip_stage1 else "auto-detection (inputs changed)"
 
     if can_skip_stage1:
         # Stage 1 SKIP: Only preference fields changed
         # Preserve: competitorSnapshot, confirmedCompetitors, chatSnapshot
         # Clear: allocationResult
-        logger.info(f"[ExternalRunId {external_run_id}] Skipping Stage 1 - only preference fields changed")
+        logger.info(f"[ExternalRunId {external_run_id}] Skipping Stage 1 - {skip_reason}")
 
         ai_run.status = "pending"
         ai_run.progressPct = 0
@@ -1236,7 +1244,7 @@ async def create_run(
         # Stage 1 REQUIRED: Customer/industry/competitors changed
         # Clear: allocationResult, competitorSnapshot, confirmedCompetitors
         # Preserve: chatSnapshot
-        logger.info(f"[ExternalRunId {external_run_id}] Running full Stage 1-4 pipeline")
+        logger.info(f"[ExternalRunId {external_run_id}] Running full Stage 1-4 pipeline - {skip_reason}")
 
         ai_run.status = "pending"
         ai_run.progressPct = 0

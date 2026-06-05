@@ -108,6 +108,10 @@ class StartRunRequest(BaseModel):
 
     run_id: int = Field(..., description="The externalRunId from ProjectVersionAiRun")
     action: str = Field(..., pattern="^start$", description="Must be 'start'")
+    definition_changed: Optional[bool] = Field(
+        None,
+        description="Frontend flag: True=run full Stage 1-4, False=skip Stage 1. If not sent, auto-detect."
+    )
 
 
 class StartRunResponse(BaseModel):
