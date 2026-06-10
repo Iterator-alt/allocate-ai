@@ -436,6 +436,13 @@ async def run_full_pipeline_background(
             if stage1_result.brand_data and stage1_result.brand_data.total_spend_teuro:
                 customer_historical_spend = stage1_result.brand_data.total_spend_teuro  # Already in EUR
 
+            # Inform Stage 2 prompt if the user changed media channels for this run
+            additional_context = inputs.goal_text
+            if (ai_run.rawPayload or {}).get("media_channels_changed"):
+                channels_note = "Note: The user has updated the media channel selection for this run. The provided channel list reflects the user's current choice."
+                additional_context = f"{additional_context}\n\n{channels_note}" if additional_context else channels_note
+                logger.info(f"[ExternalRunId {external_run_id}] media_channels_changed=True - adding channel update note to Stage 2 prompt")
+
             prompt_input = PromptAssemblyInput(
                 customer_name=inputs.customer_name,
                 industry=inputs.industry,
@@ -447,7 +454,7 @@ async def run_full_pipeline_background(
                 # IMPORTANT: Use separate brand lists - YouGov and Nielsen have different naming conventions
                 nielsen_brands=nielsen_brands[:5],  # Nielsen brand names (e.g., "EHRMANN")
                 yougov_brands=yougov_brands[:5],    # YouGov brand labels (e.g., "Ehrmann Almighurt")
-                additional_context=inputs.goal_text,
+                additional_context=additional_context,
                 goal_direction=inputs.direction,  # Pass direction to Stage 2
                 goal_text=inputs.goal_text,  # Pass goal text for Goal→Budget mode
                 customer_historical_spend=customer_historical_spend,  # Customer's historical spend in EUR
@@ -728,7 +735,15 @@ async def run_full_pipeline_background(
             ai_run.updatedAt = datetime.utcnow()
             ai_run.progressPct = 100
             ai_run.stage = None
+            flag_modified(ai_run, 'allocationResult')  # JSONB column needs explicit flag
+
             await session.commit()
+
+            # Insert feedback cards into chatSnapshot using FRESH session
+            # This is completely isolated from the pipeline ORM state
+            logger.info(f"[ExternalRunId {external_run_id}] CALLING _insert_feedback_cards with ai_run.id={ai_run.id}")
+            await _insert_feedback_cards(ai_run.id, external_run_id, allocation_result)
+            logger.info(f"[ExternalRunId {external_run_id}] _insert_feedback_cards RETURNED")
 
             logger.info(f"[ExternalRunId {external_run_id}] Pipeline completed successfully")
 
@@ -746,6 +761,149 @@ async def run_full_pipeline_background(
                     await _update_ai_run_status(session, ai_run, "failed", error=str(e))
             except Exception as e2:
                 logger.error(f"Failed to update status after error: {e2}")
+
+
+def _build_allocation_summary(allocation_result: dict) -> str:
+    """Build human-readable allocation summary for the feedback card."""
+    parts = []
+
+    # Total budget if available
+    total = allocation_result.get("total_budget_eur")
+    if total:
+        parts.append(f"Total Budget: EUR {total:,.0f}")
+
+    # Channel breakdown (field is "allocations" not "channel_allocations")
+    allocations = allocation_result.get("allocations", [])
+    if allocations:
+        parts.append("\nAllocation:")
+        for alloc in allocations:
+            channel = alloc.get("channel", "Unknown")
+            amount = alloc.get("budget_gross_eur") or alloc.get("amount_eur") or 0
+            pct = alloc.get("share_pct") or alloc.get("percentage") or 0
+            parts.append(f"  • {channel}: EUR {amount:,.0f} ({pct:.1f}%)")
+
+    # Reasoning summary
+    reasoning = allocation_result.get("reasoning_summary")
+    if reasoning:
+        parts.append(f"\nReasoning: {reasoning}")
+
+    return "\n".join(parts)
+
+
+async def _insert_feedback_cards(
+    ai_run_id: str,
+    external_run_id: int,
+    allocation_result: dict,
+) -> None:
+    """Insert feedback cards into chatSnapshot when allocation completes.
+
+    Inserts at the BEGINNING of messages array:
+    1. Warning cards (if any) - one message per warning
+    2. Allocation summary card
+
+    Stale feedback cards from previous runs are removed first, so the
+    snapshot always contains cards for the latest allocation only.
+
+    Cards have role="system" and card_type for frontend styling.
+
+    Uses a FRESH database session to completely isolate from pipeline ORM state.
+    """
+    from sqlalchemy import update, text
+    from src.db.session import async_session_factory
+
+    try:
+        logger.info(f"[ExternalRunId {external_run_id}] Starting _insert_feedback_cards with fresh session, ai_run_id={ai_run_id} (type={type(ai_run_id).__name__})")
+
+        # Use completely fresh session, isolated from pipeline session
+        async with async_session_factory() as fresh_session:
+            # Get existing chatSnapshot directly from database
+            query = select(PrismaProjectVersionAiRun.chatSnapshot).where(
+                PrismaProjectVersionAiRun.id == ai_run_id
+            )
+            result = await fresh_session.execute(query)
+            existing_snapshot = result.scalar_one_or_none()
+            existing_messages = existing_snapshot.get("messages", []) if existing_snapshot else []
+
+            logger.info(f"[ExternalRunId {external_run_id}] Existing chatSnapshot has {len(existing_messages)} messages")
+
+            # Drop stale feedback cards from previous runs so cards are never duplicated;
+            # the snapshot should only carry cards for the latest allocation result.
+            stale_count = sum(
+                1 for msg in existing_messages
+                if msg.get("role") == "system"
+                and msg.get("card_type") in ("allocation_summary", "warning")
+            )
+            if stale_count:
+                existing_messages = [
+                    msg for msg in existing_messages
+                    if not (
+                        msg.get("role") == "system"
+                        and msg.get("card_type") in ("allocation_summary", "warning")
+                    )
+                ]
+                logger.info(f"[ExternalRunId {external_run_id}] Removed {stale_count} stale feedback cards from previous run")
+
+            # Build new cards to insert at beginning
+            cards_to_insert = []
+            timestamp = datetime.utcnow().isoformat()
+
+            # 1. Warning cards (if any)
+            warnings = allocation_result.get("warnings", [])
+            for i, warning in enumerate(warnings):
+                cards_to_insert.append({
+                    "id": f"warning_{i}",
+                    "role": "system",
+                    "card_type": "warning",
+                    "content": warning,
+                    "created_at": timestamp,
+                })
+
+            # 2. Allocation summary card
+            summary_content = _build_allocation_summary(allocation_result)
+            cards_to_insert.append({
+                "id": "summary_0",
+                "role": "system",
+                "card_type": "allocation_summary",
+                "content": summary_content,
+                "created_at": timestamp,
+            })
+
+            # Re-index existing messages (shift integer IDs)
+            for idx, msg in enumerate(existing_messages):
+                if isinstance(msg.get("id"), int):
+                    msg["id"] = idx + len(cards_to_insert)
+
+            # Combine: cards first, then existing messages
+            chat_snapshot = {
+                "messages": cards_to_insert + existing_messages,
+                "updated_at": timestamp,
+            }
+
+            # Use direct SQL UPDATE
+            stmt = update(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.id == ai_run_id
+            ).values(chatSnapshot=chat_snapshot)
+            await fresh_session.execute(stmt)
+            await fresh_session.commit()
+
+            logger.info(f"[ExternalRunId {external_run_id}] Inserted {len(cards_to_insert)} feedback cards into chatSnapshot")
+            logger.info(f"[ExternalRunId {external_run_id}] chatSnapshot now has {len(chat_snapshot.get('messages', []))} total messages")
+
+            # Verify the update
+            verify_result = await fresh_session.execute(
+                select(PrismaProjectVersionAiRun.chatSnapshot).where(
+                    PrismaProjectVersionAiRun.id == ai_run_id
+                )
+            )
+            verified_snapshot = verify_result.scalar_one_or_none()
+            if verified_snapshot:
+                logger.info(f"[ExternalRunId {external_run_id}] VERIFIED: chatSnapshot has {len(verified_snapshot.get('messages', []))} messages after commit")
+            else:
+                logger.warning(f"[ExternalRunId {external_run_id}] VERIFICATION FAILED: chatSnapshot is NULL after commit")
+
+    except Exception as e:
+        logger.error(f"[ExternalRunId {external_run_id}] FEEDBACK CARDS FAILED: {e}", exc_info=True)
+        # Do not raise - feedback cards are non-critical, pipeline should complete regardless
 
 
 async def _update_ai_run_status(
@@ -873,6 +1031,13 @@ async def _run_stages_2_to_4_pipeline(
             # Build prompt
             total_budget = Decimal(str(inputs.total_budget)) if inputs.total_budget else None
 
+            # Inform Stage 2 prompt if the user changed media channels for this run
+            additional_context = inputs.goal_text
+            if (ai_run.rawPayload or {}).get("media_channels_changed"):
+                channels_note = "Note: The user has updated the media channel selection for this run. The provided channel list reflects the user's current choice."
+                additional_context = f"{additional_context}\n\n{channels_note}" if additional_context else channels_note
+                logger.info(f"[ExternalRunId {external_run_id}] media_channels_changed=True - adding channel update note to Stage 2 prompt")
+
             prompt_input = PromptAssemblyInput(
                 customer_name=inputs.customer_name,
                 industry=inputs.industry,
@@ -883,7 +1048,7 @@ async def _run_stages_2_to_4_pipeline(
                 channels=inputs.media_channels,
                 nielsen_brands=nielsen_brands[:5],
                 yougov_brands=yougov_brands[:5],
-                additional_context=inputs.goal_text,
+                additional_context=additional_context,
                 goal_direction=inputs.direction,
                 goal_text=inputs.goal_text,
                 customer_historical_spend=customer_historical_spend,
@@ -1120,7 +1285,15 @@ async def _run_stages_2_to_4_pipeline(
             ai_run.updatedAt = datetime.utcnow()
             ai_run.progressPct = 100
             ai_run.stage = None
+            flag_modified(ai_run, 'allocationResult')  # JSONB column needs explicit flag
+
             await session.commit()
+
+            # Insert feedback cards into chatSnapshot using FRESH session
+            # This is completely isolated from the pipeline ORM state
+            logger.info(f"[ExternalRunId {external_run_id}] CALLING _insert_feedback_cards with ai_run.id={ai_run.id}")
+            await _insert_feedback_cards(ai_run.id, external_run_id, allocation_result)
+            logger.info(f"[ExternalRunId {external_run_id}] _insert_feedback_cards RETURNED")
 
             logger.info(f"[ExternalRunId {external_run_id}] Stage 2-4 pipeline completed successfully")
 
@@ -1213,6 +1386,15 @@ async def create_run(
         can_skip_stage1 = should_skip_stage1(inputs, ai_run)
         skip_reason = "auto-detection" if can_skip_stage1 else "auto-detection (inputs changed)"
 
+    # media_channels_changed NEVER affects the Stage 1 skip decision - channel
+    # changes don't require a Stage 1 rerun. Logged for traceability and passed
+    # through to Stage 2 (via rawPayload) so the prompt knows channels changed.
+    if run_request.media_channels_changed is not None:
+        logger.info(
+            f"[ExternalRunId {external_run_id}] media_channels_changed="
+            f"{run_request.media_channels_changed} (informational only - does not affect Stage 1 skip)"
+        )
+
     if can_skip_stage1:
         # Stage 1 SKIP: Only preference fields changed
         # Preserve: competitorSnapshot, confirmedCompetitors, chatSnapshot
@@ -1229,6 +1411,8 @@ async def create_run(
 
         # Save current inputs for future skip detection
         save_inputs_to_raw_payload(ai_run, inputs)
+        ai_run.rawPayload["media_channels_changed"] = bool(run_request.media_channels_changed)
+        flag_modified(ai_run, "rawPayload")
         await db.commit()
 
         # Start Stage 2-4 only pipeline in background
@@ -1258,6 +1442,8 @@ async def create_run(
 
         # Save current inputs for future skip detection
         save_inputs_to_raw_payload(ai_run, inputs)
+        ai_run.rawPayload["media_channels_changed"] = bool(run_request.media_channels_changed)
+        flag_modified(ai_run, "rawPayload")
         await db.commit()
 
         # Start full pipeline in background

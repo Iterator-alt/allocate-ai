@@ -1,0 +1,482 @@
+{
+  "_meta": {
+    "generated_at": "2026-06-10T11:44:47",
+    "base_url": "http://127.0.0.1:8003",
+    "auth": "All requests require header X-Session-Token",
+    "note": "All examples captured from live API calls against run_id 1 (externalRunId)."
+  },
+  "endpoints": [
+    {
+      "name": "Start Run",
+      "method": "POST",
+      "path": "/api/v1/runs",
+      "headers": {
+        "X-Session-Token": "<session-token>",
+        "Content-Type": "application/json"
+      },
+      "request_body": {
+        "run_id": 1,
+        "action": "start",
+        "definition_changed": true
+      },
+      "response": {
+        "run_id": 1,
+        "status": "started",
+        "error_message": null
+      },
+      "notes": "run_id is the externalRunId from ProjectVersionAiRun. definition_changed: true forces full Stage 1-4 (competitor matching + confirmation); false skips Stage 1 and goes straight to generation using existing confirmedCompetitors; omit for auto-detection. Rate limited to 20/hour. After starting, poll GET /runs/{run_id}/status."
+    },
+    {
+      "name": "Poll Run Status",
+      "method": "GET",
+      "path": "/api/v1/runs/{run_id}/status",
+      "headers": {
+        "X-Session-Token": "<session-token>"
+      },
+      "request_body": null,
+      "response": {
+        "examples_by_status": {
+          "pending": {
+            "id": 1,
+            "status": "pending",
+            "stage": null,
+            "progress_pct": 0,
+            "started_at": "2026-06-10T06:05:22.117000",
+            "completed_at": "2026-06-10T06:06:40.671000",
+            "error_message": null,
+            "progress": "Queued for processing",
+            "queue_position": null,
+            "eta_seconds": null
+          },
+          "matching": {
+            "id": 1,
+            "status": "matching",
+            "stage": "S1",
+            "progress_pct": 10,
+            "started_at": "2026-06-10T06:11:24.511000",
+            "completed_at": "2026-06-10T06:06:40.671000",
+            "error_message": null,
+            "progress": "Finding competitor brands...",
+            "queue_position": null,
+            "eta_seconds": null
+          },
+          "awaiting_confirmation": {
+            "id": 1,
+            "status": "awaiting_confirmation",
+            "stage": null,
+            "progress_pct": 30,
+            "started_at": "2026-06-10T06:11:24.511000",
+            "completed_at": "2026-06-10T06:06:40.671000",
+            "error_message": null,
+            "progress": "Waiting for competitor confirmation...",
+            "queue_position": null,
+            "eta_seconds": null
+          },
+          "generating": {
+            "id": 1,
+            "status": "generating",
+            "stage": "S2",
+            "progress_pct": 40,
+            "started_at": "2026-06-10T06:12:53.904000",
+            "completed_at": "2026-06-10T06:06:40.671000",
+            "error_message": null,
+            "progress": "Generating allocation with AI...",
+            "queue_position": null,
+            "eta_seconds": null
+          },
+          "completed": {
+            "id": 1,
+            "status": "completed",
+            "stage": null,
+            "progress_pct": 100,
+            "started_at": "2026-06-10T06:12:53.904000",
+            "completed_at": "2026-06-10T06:14:25.631000",
+            "error_message": null,
+            "progress": "Completed",
+            "queue_position": null,
+            "eta_seconds": null
+          }
+        }
+      },
+      "notes": "Status progression: pending -> matching (S1) -> awaiting_confirmation -> generating (S2) -> parsing (S3) -> completing (S4) -> completed. Any stage can transition to failed. When status=awaiting_confirmation, frontend must read competitorSnapshot from DB, let user confirm, save confirmedCompetitors to DB, then call the confirm endpoint. Note: when Stage 1 is skipped (definition_changed=false), matching/awaiting_confirmation do not occur. Fast stages (parsing/completing) may not be observable when polling at 1s intervals."
+    },
+    {
+      "name": "Get Competitor List (DB read, not an API call)",
+      "method": "DB",
+      "path": "Table: \"ProjectVersionAiRun\", column: \"competitorSnapshot\" (JSONB)",
+      "headers": null,
+      "request_body": null,
+      "response": {
+        "example_competitorSnapshot": {
+          "brand_info": {
+            "confidence": 0.95,
+            "match_type": "similarity",
+            "brand_label": "Ehrmann Almighurt",
+            "nielsen_brand": "EHRMANN"
+          },
+          "competitors": [
+            {
+              "avg_kpi_score": 3.921636968862917,
+              "nielsen_brand": "DANONE",
+              "has_yougov_data": true,
+              "total_spend_eur": 181839139.99999997,
+              "has_nielsen_data": true,
+              "match_confidence": 1.0,
+              "wirtschaftsgruppe": "Lebensmittel",
+              "yougov_brand_label": "Dany Sahne (Danone)"
+            },
+            {
+              "avg_kpi_score": 10.979955801603184,
+              "nielsen_brand": "EXQUISA",
+              "has_yougov_data": true,
+              "total_spend_eur": 5991600210.000003,
+              "has_nielsen_data": true,
+              "match_confidence": 1.0,
+              "wirtschaftsgruppe": "Lebensmittel",
+              "yougov_brand_label": "Exquisa"
+            }
+          ],
+          "yougov_sectors": [
+            "Food II",
+            "Lebensmittel I"
+          ],
+          "nielsen_sectors": [
+            "Food"
+          ]
+        }
+      },
+      "notes": "Frontend reads ProjectVersionAiRun.competitorSnapshot directly from the database when status=awaiting_confirmation. Look up the row by externalRunId. Each entry in competitors[] has yougov_brand_label (canonical name to display/confirm), nielsen fields and data-availability flags. After the user confirms a selection, the frontend must write the chosen brand names (array of strings from yougov_brand_label) to the confirmedCompetitors JSONB column on the same row BEFORE calling POST /runs/{run_id}/competitors/confirm."
+    },
+    {
+      "name": "Confirm Competitors (approved)",
+      "method": "POST",
+      "path": "/api/v1/runs/{run_id}/competitors/confirm",
+      "headers": {
+        "X-Session-Token": "<session-token>",
+        "Content-Type": "application/json"
+      },
+      "request_body": {
+        "run_id": 1,
+        "action": "approved"
+      },
+      "response": {
+        "run_id": 1,
+        "status": "approved",
+        "confirmed_competitors": [
+          "Dany Sahne (Danone)",
+          "Exquisa",
+          "Zott Sahne Joghurt",
+          "Landliebe"
+        ],
+        "message": "Competitors confirmed, proceeding to allocation generation"
+      },
+      "notes": "Only valid while status=awaiting_confirmation. run_id in body must match URL. confirmedCompetitors must already be saved to DB by the frontend, otherwise 400. On success Stage 2-4 runs in background; continue polling status."
+    },
+    {
+      "name": "Confirm Competitors (dismissed)",
+      "method": "POST",
+      "path": "/api/v1/runs/{run_id}/competitors/confirm",
+      "headers": {
+        "X-Session-Token": "<session-token>",
+        "Content-Type": "application/json"
+      },
+      "request_body": {
+        "run_id": 1,
+        "action": "dismissed"
+      },
+      "response": {
+        "run_id": 1,
+        "status": "cancelled",
+        "confirmed_competitors": null,
+        "message": "Run cancelled"
+      },
+      "notes": "Cancels the run; status becomes 'cancelled'. The run can be started again later with POST /api/v1/runs."
+    },
+    {
+      "name": "Search Competitor",
+      "method": "GET",
+      "path": "/api/v1/runs/{run_id}/competitors/search?q=<brand>",
+      "headers": {
+        "X-Session-Token": "<session-token>"
+      },
+      "request_body": null,
+      "response": {
+        "case_found_in_snapshot": {
+          "query": "Zott",
+          "response": {
+            "found": true,
+            "results": [
+              {
+                "source": "snapshot",
+                "brand": "Zott Sahne Joghurt",
+                "has_yougov_data": true,
+                "has_nielsen_data": true,
+                "warning": null
+              }
+            ],
+            "warning": null
+          }
+        },
+        "case_found_in_database": {
+          "query": "Müller",
+          "response": {
+            "found": true,
+            "results": [
+              {
+                "source": "database",
+                "brand": "Müller/Müllermilch",
+                "has_yougov_data": true,
+                "has_nielsen_data": true,
+                "warning": null
+              }
+            ],
+            "warning": null
+          }
+        },
+        "case_found_yougov_only": {
+          "query": "Almighurt",
+          "response": {
+            "found": true,
+            "results": [
+              {
+                "source": "database",
+                "brand": "Ehrmann Almighurt",
+                "has_yougov_data": true,
+                "has_nielsen_data": false,
+                "warning": "No Nielsen spend data available for this brand."
+              }
+            ],
+            "warning": null
+          }
+        },
+        "case_not_found": {
+          "query": "Tesla",
+          "response": {
+            "found": false,
+            "results": [],
+            "warning": "Brand not found in our database."
+          }
+        }
+      },
+      "notes": "Search order: competitorSnapshot first (source='snapshot'), then YouGov + Nielsen databases (source='database'). has_yougov_data / has_nielsen_data indicate data availability; a YouGov-only match carries warning 'No Nielsen spend data available for this brand.'. found=false with warning 'Brand not found in our database.' when nothing matches. Matching is case-insensitive, partial, and umlaut-tolerant (Muller matches Müller)."
+    },
+    {
+      "name": "Get Result",
+      "method": "GET",
+      "path": "/api/v1/runs/{run_id}/result",
+      "headers": {
+        "X-Session-Token": "<session-token>"
+      },
+      "request_body": null,
+      "response": {
+        "run_id": 1,
+        "warnings": [],
+        "is_cached": false,
+        "created_at": "2026-06-10T06:14:25.435022",
+        "updated_at": "2026-06-10T06:14:25.435035",
+        "allocations": [
+          {
+            "channel": "TV",
+            "reasoning": "Landliebe spent €79,305,265 on FERNSEHEN with a +5.76pp KPI change. Zott Sahne Joghurt spent €18,271,818 with a -0.32pp change. FERNSEHEN dominates competitor spend (approx. 75% of total market spend on this channel), recommending 50% allocation due to Landliebe's significant KPI uplift.",
+            "share_pct": 50.0,
+            "budget_gross_eur": 500000.0
+          },
+          {
+            "channel": "Radio",
+            "reasoning": "Landliebe spent €12,796,993 on RADIO with a +5.76pp KPI change. Despite not being the largest spend, it achieved a high KPI uplift, recommending 15% allocation.",
+            "share_pct": 15.0,
+            "budget_gross_eur": 150000.0
+          },
+          {
+            "channel": "Digital",
+            "reasoning": "Landliebe spent €6,318,249 on ONLINE with a +5.76pp KPI change, while Dany Sahne spent €2,785,618 with -1.25pp. ONLINE received significant positive results from Landliebe, suggesting a 20% allocation.",
+            "share_pct": 20.0,
+            "budget_gross_eur": 200000.0
+          },
+          {
+            "channel": "OOH",
+            "reasoning": "Landliebe spent €6,166,738 on PLAKAT with a +5.76pp KPI change. Zott Sahne Joghurt spent €1,529,198 with a -0.32pp change. Given Landliebe's success, a 10% allocation is recommended.",
+            "share_pct": 10.0,
+            "budget_gross_eur": 100000.0
+          },
+          {
+            "channel": "Print",
+            "reasoning": "Zott Sahne Joghurt spent €2,205,865 on ZEITUNGEN with a -0.32pp KPI change, which is the smallest decline among non-positive changes. This indicates a relatively stable channel, thus a minimal 5% allocation.",
+            "share_pct": 5.0,
+            "budget_gross_eur": 50000.0
+          }
+        ],
+        "kpi_projection": 1.5,
+        "confidence_score": 0.85,
+        "total_budget_eur": 1000000.0,
+        "reasoning_summary": "Using Landliebe and Zott Sahne Joghurt as benchmarks (combined spend focused on FERNSEHEN and RADIO with significant KPI changes of +5.76pp and -0.32pp). Strategy focuses on channels where Landliebe achieved the highest ad awareness uplift."
+      },
+      "notes": "Only available when status=completed (otherwise 400). Returns the allocationResult JSON verbatim. allocations[] entries use channel, share_pct, budget_gross_eur, reasoning."
+    },
+    {
+      "name": "Get Chat History",
+      "method": "GET",
+      "path": "/api/v1/chat/{run_id}/history?limit=50",
+      "headers": {
+        "X-Session-Token": "<session-token>"
+      },
+      "request_body": null,
+      "response": {
+        "run_id": 1,
+        "messages": [
+          {
+            "id": "summary_0",
+            "role": "system",
+            "content": "Total Budget: EUR 1,000,000\n\nAllocation:\n  • TV: EUR 600,000 (60.0%)\n  • Radio: EUR 150,000 (15.0%)\n  • Digital: EUR 150,000 (15.0%)\n  • OOH: EUR 50,000 (5.0%)\n  • Print: EUR 50,000 (5.0%)\n\nReasoning: Using Landliebe and Zott Sahne Joghurt as benchmarks (combined spend €113,785,723, KPI changes of +5.76pp and -0.32pp). Strategy focuses on leveraging FERNSEHEN and ONLINE for high impact due to their strong performance in Landliebe's media strategy.",
+            "card_type": "allocation_summary",
+            "tool_used": null,
+            "changes_made": [],
+            "created_at": "2026-06-10T06:06:43.159450"
+          },
+          {
+            "id": "summary_0",
+            "role": "system",
+            "content": "Total Budget: EUR 1,000,000\n\nAllocation:\n  • TV: EUR 600,000 (60.0%)\n  • Radio: EUR 150,000 (15.0%)\n  • Digital: EUR 150,000 (15.0%)\n  • OOH: EUR 50,000 (5.0%)\n  • Print: EUR 50,000 (5.0%)\n\nReasoning: Using Landliebe and Zott Sahne Joghurt as benchmarks (combined spend €103,240,327, KPI changes of +5.76pp and -0.32pp respectively). Strategy focuses on channels where Landliebe achieved substantial positive KPI changes, indicating high efficiency.",
+            "card_type": "allocation_summary",
+            "tool_used": null,
+            "changes_made": [],
+            "created_at": "2026-06-10T05:18:18.397987"
+          },
+          {
+            "id": 2,
+            "role": "user",
+            "content": "What is the total budget?",
+            "card_type": null,
+            "tool_used": null,
+            "changes_made": [],
+            "created_at": "2026-06-10T05:19:12.225642"
+          },
+          {
+            "id": 3,
+            "role": "agent",
+            "content": "The total budget is EUR 1,000,000.",
+            "card_type": null,
+            "tool_used": "question",
+            "changes_made": [],
+            "created_at": "2026-06-10T05:19:12.818610"
+          },
+          {
+            "...": "30 messages omitted for brevity"
+          },
+          {
+            "id": 34,
+            "role": "user",
+            "content": "change budget to 2 million",
+            "card_type": null,
+            "tool_used": null,
+            "changes_made": [],
+            "created_at": "2026-06-10T06:14:44.504446"
+          },
+          {
+            "id": 35,
+            "role": "agent",
+            "content": "Please update this in the Definition Area and click Generate to rerun the allocation.",
+            "card_type": null,
+            "tool_used": "blocked_edit",
+            "changes_made": [],
+            "created_at": "2026-06-10T06:14:45.114840"
+          }
+        ],
+        "total_count": 36
+      },
+      "notes": "Returns messages from chatSnapshot. role is 'system', 'user' or 'agent'. System feedback cards (allocation summary, warnings) are inserted automatically at the start when a run completes; cards have card_type 'allocation_summary' or 'warning' and a string id ('summary_0', 'warning_0'), while user/agent messages have int ids and card_type null. NOTE: each run completion prepends a new summary card and older cards remain, so multiple cards with id 'summary_0' can appear after reruns - the newest card is first. limit defaults to 50, returns most recent messages; total_count is the full count."
+    },
+    {
+      "name": "Send Chat Message (Q&A)",
+      "method": "POST",
+      "path": "/api/v1/chat/message",
+      "headers": {
+        "X-Session-Token": "<session-token>",
+        "Content-Type": "application/json"
+      },
+      "request_body": {
+        "run_id": 1,
+        "project_id": 1,
+        "message": "How much was allocated to TV?"
+      },
+      "response": {
+        "agent_response": "The budget allocated to TV is EUR 500,000, which represents 50.0% of the total budget.",
+        "tool_used": "question",
+        "updated_competitor_set": null,
+        "updated_inputs": null,
+        "rerun_triggered": false,
+        "rerun_blocked_reason": null,
+        "chat_message_id": 33,
+        "new_run_id": null,
+        "pending_changes": []
+      },
+      "notes": "Simple mode Q&A: the agent answers questions about the allocation result using LLM context (allocations, competitors, reasoning). project_id/version_id optional."
+    },
+    {
+      "name": "Send Chat Message (edit attempt in simple mode)",
+      "method": "POST",
+      "path": "/api/v1/chat/message",
+      "headers": {
+        "X-Session-Token": "<session-token>",
+        "Content-Type": "application/json"
+      },
+      "request_body": {
+        "run_id": 1,
+        "project_id": 1,
+        "message": "change budget to 2 million"
+      },
+      "response": {
+        "agent_response": "Please update this in the Definition Area and click Generate to rerun the allocation.",
+        "tool_used": "blocked_edit",
+        "updated_competitor_set": null,
+        "updated_inputs": null,
+        "rerun_triggered": false,
+        "rerun_blocked_reason": null,
+        "chat_message_id": 35,
+        "new_run_id": null,
+        "pending_changes": []
+      },
+      "notes": "In simple mode (chat_agent_mode=false) the agent does not modify inputs; edit requests get a redirect/explanation response and no changes are made (rerun_triggered=false, updated_inputs=null)."
+    },
+    {
+      "name": "Download Debug ZIP",
+      "method": "GET",
+      "path": "/api/v1/runs/{run_id}/debug-zip",
+      "headers": {
+        "X-Session-Token": "<session-token>"
+      },
+      "request_body": null,
+      "response": {
+        "status_code": 200,
+        "response_headers": {
+          "content-type": "application/zip",
+          "content-disposition": "attachment; filename=\"run_1_debug.zip\"",
+          "content-length": "62049"
+        },
+        "zip_contents_sample": [
+          "20260610_113646_C0_context_loaded.json",
+          "20260610_113647_C1_intent_classification.json",
+          "20260610_113648_C2_simple_mode_response.json",
+          "20260610_113653_C0_context_loaded.json",
+          "20260610_113655_C1_intent_classification.json",
+          "20260610_113655_C2_simple_mode_response.json",
+          "20260610_114125_FINAL_filtered_data.json",
+          "20260610_114125_N1_nielsen_produktmarke_filtering.json",
+          "20260610_114125_Y1_industry_resolution.json",
+          "20260610_114125_Y2_brand_and_competitors.json",
+          "20260610_114125_Y3_yougov_filtered_data.json",
+          "20260610_114254_FINAL_filtered_data.json",
+          "20260610_114254_N1_nielsen_produktmarke_filtering.json",
+          "20260610_114254_Y1_industry_resolution.json",
+          "20260610_114254_Y2_brand_and_competitors.json",
+          "20260610_114254_Y3_yougov_filtered_data.json",
+          "S2_final_result.json",
+          "S2_llm_response.txt",
+          "S2_parsed_raw.json",
+          "S2_prompt.txt"
+        ]
+      },
+      "notes": "Binary download (Content-Type: application/zip, filename run_{run_id}_debug.zip). Only exists when the server runs with STAGE1_DEBUG_MODE=True and the run produced debug files. ZIP contains per-stage debug files from debug_output/run_{run_id}/: Stage 1 matching steps (Y1_industry_resolution, Y2_brand_and_competitors, Y3_yougov_filtered_data, N1_nielsen_produktmarke_filtering, FINAL_filtered_data), allocation generation (S2_prompt.txt, S2_llm_response.txt, S2_parsed_raw.json, S2_final_result.json), and chat agent files (C0_context_loaded, C1_intent_classification, C2_simple_mode_response). Returns 404 if debug mode disabled or run not completed."
+    }
+  ]
+}

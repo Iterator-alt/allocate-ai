@@ -309,10 +309,14 @@ class ChatAgent:
             response_text = result.message
 
         if debug_run_id:
-            _save_debug_file(debug_run_id, "C2_simple_mode_response", {
+            debug_data = {
                 "intent": first_intent.value,
                 "response_text": response_text,
-            })
+            }
+            # Include compaction info if question tool was used
+            if hasattr(self.question_tool, '_last_compaction_info') and self.question_tool._last_compaction_info:
+                debug_data["compaction_info"] = self.question_tool._last_compaction_info
+            _save_debug_file(debug_run_id, "C2_simple_mode_response", debug_data)
 
         # Save messages to chatSnapshot
         await self._save_user_message(run_id, message)

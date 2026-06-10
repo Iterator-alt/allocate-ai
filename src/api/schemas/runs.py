@@ -112,6 +112,10 @@ class StartRunRequest(BaseModel):
         None,
         description="Frontend flag: True=run full Stage 1-4, False=skip Stage 1. If not sent, auto-detect."
     )
+    media_channels_changed: Optional[bool] = Field(
+        None,
+        description="Frontend flag: True=user changed media channels. Informational only - never affects Stage 1 skip; passed to Stage 2 prompt."
+    )
 
 
 class StartRunResponse(BaseModel):

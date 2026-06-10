@@ -54,11 +54,16 @@ class ChatMessageResponse(BaseModel):
 
 
 class ChatHistoryMessage(BaseModel):
-    """A single chat message."""
+    """A single chat message.
 
-    id: int
-    role: str  # "user" or "agent"
+    id is int for user/agent messages, string for system cards
+    (e.g. "summary_0", "warning_0").
+    """
+
+    id: Union[int, str]
+    role: str  # "user", "agent" or "system"
     content: str
+    card_type: Optional[str] = None  # "allocation_summary" or "warning" for system cards
     tool_used: Optional[str] = None
     changes_made: List[Dict[str, Any]] = []
     created_at: str
@@ -202,6 +207,7 @@ async def get_chat_history(
             id=msg.get("id", 0),
             role=msg.get("role", "system"),
             content=msg.get("content", ""),
+            card_type=msg.get("card_type"),
             tool_used=msg.get("tool_used"),
             changes_made=msg.get("changes_made", []),
             created_at=msg.get("created_at", ""),

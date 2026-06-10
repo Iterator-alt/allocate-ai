@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     chat_rerun_creates_new: bool = True  # True=create new run on rerun, False=update existing
     chat_agent_mode: bool = True  # True=full agent mode (tools active), False=simple mode (Q&A only)
 
+    # Chat Compaction Configuration (internal LLM context only, chatSnapshot stays intact)
+    chat_compaction_threshold: int = 10  # Compact after this many messages
+    chat_compaction_keep_recent: int = 5  # Keep this many recent messages verbatim
+
     # Competitor Confirmation Bypass
     # When True, auto-approve all competitors after Stage 1 and proceed directly to Stage 2
     # When False, wait for user to confirm competitors via POST /runs/{id}/competitors/confirm
