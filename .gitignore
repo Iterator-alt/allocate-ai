@@ -80,3 +80,10 @@ YouGov-Nielsen-Sample/
 # Knowledge files (session notes)
 26mayknowledge.txt
 27mayknowledge.txt
+*knowledge.txt
+
+# Temporary/scratch files from debugging sessions
+debug_output/
+openapi_*.json
+downloaded_test.zip
+nul

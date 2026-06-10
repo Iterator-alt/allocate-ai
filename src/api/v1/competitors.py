@@ -74,15 +74,16 @@ def strip_umlauts(text: str) -> str:
 def _search_in_snapshot(
     query: str,
     competitors: List[dict],
-) -> Optional[dict]:
+) -> List[dict]:
     """Search for a brand in the competitorSnapshot.
 
     Uses case-insensitive and umlaut-tolerant matching.
-    Returns the matched competitor dict if found.
+    Returns ALL matching competitor dicts (exact matches first).
     """
     query_lower = query.lower()
     query_ascii = strip_umlauts(query_lower)
 
+    matches = []
     for comp in competitors:
         brand_label = comp.get("yougov_brand_label", "")
         if not brand_label:
@@ -91,57 +92,44 @@ def _search_in_snapshot(
         brand_lower = brand_label.lower()
         brand_ascii = strip_umlauts(brand_lower)
 
-        # Exact match (case-insensitive)
-        if brand_lower == query_lower:
-            return comp
+        # Exact match (case-insensitive), ASCII-normalized exact match,
+        # or partial match (query contained in brand)
+        if (
+            brand_lower == query_lower
+            or brand_ascii == query_ascii
+            or query_lower in brand_lower
+            or query_ascii in brand_ascii
+        ):
+            matches.append(comp)
 
-        # ASCII-normalized exact match
-        if brand_ascii == query_ascii:
-            return comp
-
-        # Partial match (query contained in brand)
-        if query_lower in brand_lower or query_ascii in brand_ascii:
-            return comp
-
-    return None
+    # Exact matches first
+    matches.sort(key=lambda c: c.get("yougov_brand_label", "").lower() != query_lower)
+    return matches
 
 
 async def _search_yougov(
     db: AsyncSession,
     query: str,
-) -> Optional[str]:
+) -> List[str]:
     """Search for a brand in YouGov database.
 
-    Returns the canonical brand_label if found, None otherwise.
+    Returns ALL matching canonical brand_labels (exact matches first).
     """
     query_lower = query.lower()
     query_ascii = strip_umlauts(query_lower)
 
-    # Strategy 1: Exact match (case-insensitive)
-    stmt = (
-        select(YouGov.brand_label)
-        .where(func.lower(YouGov.brand_label) == query_lower)
-        .distinct()
-        .limit(1)
-    )
-    result = await db.execute(stmt)
-    row = result.first()
-    if row:
-        return row[0]
+    matches: List[str] = []
 
-    # Strategy 2: LIKE match (partial)
+    # Strategy 1: LIKE match (covers exact and partial, case-insensitive)
     stmt = (
         select(YouGov.brand_label)
         .where(func.lower(YouGov.brand_label).like(f"%{query_lower}%"))
         .distinct()
-        .limit(1)
     )
     result = await db.execute(stmt)
-    row = result.first()
-    if row:
-        return row[0]
+    matches.extend(row[0] for row in result.all() if row[0])
 
-    # Strategy 3: ASCII-normalized match (for umlauts)
+    # Strategy 2: ASCII-normalized match (for umlauts) - add any not already found
     stmt = (
         select(YouGov.brand_label)
         .distinct()
@@ -150,50 +138,39 @@ async def _search_yougov(
     result = await db.execute(stmt)
     for row in result.all():
         candidate = row[0]
-        if candidate:
+        if candidate and candidate not in matches:
             candidate_ascii = strip_umlauts(candidate.lower())
             if candidate_ascii == query_ascii or query_ascii in candidate_ascii:
-                return candidate
+                matches.append(candidate)
 
-    return None
+    # Exact matches first, then alphabetical
+    matches.sort(key=lambda b: (b.lower() != query_lower, b.lower()))
+    return matches
 
 
 async def _search_nielsen(
     db: AsyncSession,
     query: str,
-) -> Optional[str]:
+) -> List[str]:
     """Search for a brand in Nielsen database.
 
-    Returns the canonical marke if found, None otherwise.
+    Returns ALL matching canonical markes (exact matches first).
     """
     query_lower = query.lower()
     query_ascii = strip_umlauts(query_lower)
 
-    # Strategy 1: Exact match (case-insensitive)
-    stmt = (
-        select(Nielsen.marke)
-        .where(func.lower(Nielsen.marke) == query_lower)
-        .distinct()
-        .limit(1)
-    )
-    result = await db.execute(stmt)
-    row = result.first()
-    if row:
-        return row[0]
+    matches: List[str] = []
 
-    # Strategy 2: LIKE match (partial)
+    # Strategy 1: LIKE match (covers exact and partial, case-insensitive)
     stmt = (
         select(Nielsen.marke)
         .where(func.lower(Nielsen.marke).like(f"%{query_lower}%"))
         .distinct()
-        .limit(1)
     )
     result = await db.execute(stmt)
-    row = result.first()
-    if row:
-        return row[0]
+    matches.extend(row[0] for row in result.all() if row[0])
 
-    # Strategy 3: ASCII-normalized match
+    # Strategy 2: ASCII-normalized match - add any not already found
     stmt = (
         select(Nielsen.marke)
         .distinct()
@@ -202,12 +179,14 @@ async def _search_nielsen(
     result = await db.execute(stmt)
     for row in result.all():
         candidate = row[0]
-        if candidate:
+        if candidate and candidate not in matches:
             candidate_ascii = strip_umlauts(candidate.lower())
             if candidate_ascii == query_ascii or query_ascii in candidate_ascii:
-                return candidate
+                matches.append(candidate)
 
-    return None
+    # Exact matches first, then alphabetical
+    matches.sort(key=lambda b: (b.lower() != query_lower, b.lower()))
+    return matches
 
 
 async def get_ai_run_by_external_id(db: AsyncSession, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
@@ -259,64 +238,62 @@ async def search_competitor(
     snapshot = ai_run.competitorSnapshot or {}
     snapshot_competitors = snapshot.get("competitors", [])
 
-    snapshot_match = _search_in_snapshot(q, snapshot_competitors)
-    if snapshot_match:
+    snapshot_matches = _search_in_snapshot(q, snapshot_competitors)
+    if snapshot_matches:
         return CompetitorSearchResponse(
             found=True,
-            results=[CompetitorSearchResult(
-                source="snapshot",
-                brand=snapshot_match.get("yougov_brand_label"),
-                has_yougov_data=snapshot_match.get("has_yougov_data", True),
-                has_nielsen_data=snapshot_match.get("has_nielsen_data", False),
-                warning=None,
-            )],
+            results=[
+                CompetitorSearchResult(
+                    source="snapshot",
+                    brand=match.get("yougov_brand_label"),
+                    has_yougov_data=match.get("has_yougov_data", True),
+                    has_nielsen_data=match.get("has_nielsen_data", False),
+                    warning=None,
+                )
+                for match in snapshot_matches
+            ],
             warning=None,
         )
 
-    # Step 2: Search YouGov database
-    yougov_brand = await _search_yougov(db, q)
+    # Step 2: Search YouGov database (all matches)
+    yougov_brands = await _search_yougov(db, q)
 
-    # Step 3: Search Nielsen database
-    nielsen_brand = await _search_nielsen(db, q)
+    # Step 3: Search Nielsen database (all matches)
+    nielsen_brands = await _search_nielsen(db, q)
 
-    # Step 4: Return result based on what was found
-    if yougov_brand and nielsen_brand:
-        # Found in both
+    # Step 4: Return all matches found
+    if yougov_brands:
+        # YouGov labels are canonical. Nielsen availability is query-level:
+        # if the query matched any Nielsen marke, spend data exists for the brand family.
+        has_nielsen = bool(nielsen_brands)
         return CompetitorSearchResponse(
             found=True,
-            results=[CompetitorSearchResult(
-                source="database",
-                brand=yougov_brand,  # Use YouGov label as canonical
-                has_yougov_data=True,
-                has_nielsen_data=True,
-                warning=None,
-            )],
+            results=[
+                CompetitorSearchResult(
+                    source="database",
+                    brand=brand,
+                    has_yougov_data=True,
+                    has_nielsen_data=has_nielsen,
+                    warning=None if has_nielsen else "No Nielsen spend data available for this brand.",
+                )
+                for brand in yougov_brands
+            ],
             warning=None,
         )
-    elif yougov_brand:
-        # YouGov only
-        return CompetitorSearchResponse(
-            found=True,
-            results=[CompetitorSearchResult(
-                source="database",
-                brand=yougov_brand,
-                has_yougov_data=True,
-                has_nielsen_data=False,
-                warning="No Nielsen spend data available for this brand.",
-            )],
-            warning=None,
-        )
-    elif nielsen_brand:
+    elif nielsen_brands:
         # Nielsen only (rare case)
         return CompetitorSearchResponse(
             found=True,
-            results=[CompetitorSearchResult(
-                source="database",
-                brand=nielsen_brand,
-                has_yougov_data=False,
-                has_nielsen_data=True,
-                warning="No YouGov perception data available for this brand.",
-            )],
+            results=[
+                CompetitorSearchResult(
+                    source="database",
+                    brand=brand,
+                    has_yougov_data=False,
+                    has_nielsen_data=True,
+                    warning="No YouGov perception data available for this brand.",
+                )
+                for brand in nielsen_brands
+            ],
             warning=None,
         )
     else:
