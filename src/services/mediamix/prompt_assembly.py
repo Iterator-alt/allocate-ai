@@ -56,6 +56,7 @@ class PromptAssemblyInput:
     goal_direction: Optional[str] = None  # "budget_to_impact" or "goal_to_budget" or "increase"
     goal_text: Optional[str] = None  # Original goal text for Goal→Budget mode
     customer_historical_spend: Optional[float] = None  # Customer's historical total spend in EUR
+    chat_preferences: Optional[str] = None  # Net allocation preferences extracted from chat
 
 
 class PromptAssemblyService:
@@ -288,6 +289,7 @@ Return JSON:
             "goal_direction": input_params.goal_direction,
             "goal_text": input_params.goal_text,
             "mode": "budget_to_impact" if is_budget_mode else "goal_to_budget",
+            "chat_preferences_applied": bool(input_params.chat_preferences),
             "year": data_result.year,
             "num_competitors": len(data_result.competitor_kpi_profiles),
             "num_kpi_profiles": len(data_result.competitor_kpi_profiles),
@@ -351,6 +353,16 @@ Return JSON:
             # In budget mode, additional_context is extra info
             additional_context = f"\n## Additional Context\n{input_params.additional_context}"
 
+        # Chat preferences section (appended in both modes when present)
+        chat_preferences_section = ""
+        if input_params.chat_preferences:
+            chat_preferences_section = (
+                "\n## User Preferences from Chat\n"
+                "The user expressed the following allocation preferences in chat since the last run.\n"
+                "Apply them when generating this allocation, while still respecting all allocation rules:\n"
+                f"{input_params.chat_preferences}"
+            )
+
         if is_budget_mode:
             # BUDGET → IMPACT mode
             total_budget = float(input_params.total_budget) if input_params.total_budget else 0
@@ -363,7 +375,7 @@ Return JSON:
                 channels_line=channels_line,
                 data_context=data_context,
                 expert_knowledge=expert_knowledge,
-                additional_context=additional_context,
+                additional_context=additional_context + chat_preferences_section,
             )
         else:
             # GOAL → BUDGET mode
@@ -387,7 +399,7 @@ Return JSON:
                 channels_line=channels_line,
                 data_context=data_context,
                 expert_knowledge=expert_knowledge,
-                additional_context="",  # Goal text is already in the template
+                additional_context=chat_preferences_section,  # Goal text is already in {goal_text}
                 customer_historical_spend_line=customer_historical_spend_line,
                 customer_historical_spend_formatted=customer_historical_spend_formatted,
             )

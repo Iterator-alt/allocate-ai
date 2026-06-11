@@ -44,8 +44,8 @@ class Settings(BaseSettings):
     chat_agent_mode: bool = True  # True=full agent mode (tools active), False=simple mode (Q&A only)
 
     # Chat Compaction Configuration (internal LLM context only, chatSnapshot stays intact)
-    chat_compaction_threshold: int = 10  # Compact after this many messages
-    chat_compaction_keep_recent: int = 5  # Keep this many recent messages verbatim
+    chat_compaction_threshold: int = 20  # Compact after this many messages (= 10 exchanges)
+    chat_compaction_keep_recent: int = 10  # Keep this many recent messages verbatim (= 5 exchanges)
 
     # Competitor Confirmation Bypass
     # When True, auto-approve all competitors after Stage 1 and proceed directly to Stage 2

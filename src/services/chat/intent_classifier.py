@@ -24,6 +24,7 @@ class IntentType(str, Enum):
     EDIT_INPUT = "edit_input"
     RERUN = "rerun"
     UNKNOWN = "unknown"
+    ALLOCATION_PREFERENCE = "allocation_preference"  # User expresses allocation weighting / goal adjustment
 
     # Simple mode intents
     QUESTION = "question"  # General question about allocation result
@@ -56,7 +57,8 @@ INTENT_CLASSIFICATION_SYSTEM_PROMPT = """You are an intent classifier for a medi
 Given a user message, classify it into ONE of these intents:
 - competitor_add: User wants to add a brand/competitor to the analysis
 - competitor_remove: User wants to remove a brand/competitor from the analysis
-- edit_input: User wants to change campaign parameters (budget, channels, goal, KPI direction)
+- edit_input: User wants to change campaign parameters (budget total, channel list membership, KPI type, KPI direction)
+- allocation_preference: User expresses how the allocation should be weighted or shifted between the existing channels (e.g., "increase TV by 10%", "less Print", "prioritize Digital", "don't over-invest in Radio") OR adjusts the goal/strategy in free text (e.g., "the goal should focus more on younger audiences")
 - rerun: User explicitly wants to regenerate/rerun the allocation (phrases: "rerun", "regenerate", "apply changes", "run again", "redo")
 - unknown: Cannot determine intent, need clarification
 
@@ -65,21 +67,21 @@ IMPORTANT RULES:
 2. For rerun: ONLY classify as rerun for explicit phrases like "rerun", "regenerate", "apply changes", "run again", "redo"
 3. Do NOT classify as rerun for: "looks good", "okay", "thanks", "yes", confirmations
 4. Extract relevant entities (brand names, field names, values)
+5. edit_input vs allocation_preference: edit_input is ONLY for changing the budget total, the KPI type, the KPI direction, or adding/removing channels from the channel selection. Shifting weight between existing channels or adjusting the goal/strategy wording is allocation_preference, NOT edit_input.
 
 Editable fields:
 - total_budget: Budget amount (e.g., "set budget to 500000", "budget 500k")
 - channels: Channel list (e.g., "add TV channel", "remove digital")
-- goal_text: Goal description (e.g., "change goal to increase awareness")
 - brand_kpi: KPI type - must be one of: adaware, aided, consider
 - direction: KPI direction - must be one of: increase, maintain, decrease
 
 Respond in JSON format:
 {
-    "intent": "competitor_add|competitor_remove|edit_input|rerun|unknown",
+    "intent": "competitor_add|competitor_remove|edit_input|allocation_preference|rerun|unknown",
     "confidence": 0.0-1.0,
     "entities": {
         "brands": ["brand1", "brand2"],
-        "field": "total_budget|channels|goal_text|brand_kpi|direction",
+        "field": "total_budget|channels|brand_kpi|direction",
         "value": "the new value",
         "action": "add|remove" (for channels)
     },
@@ -194,7 +196,8 @@ User message: {message}"""
 
         In simple mode:
         - Questions about the result -> QUESTION
-        - Edit attempts (budget, KPI, channels, goal, customer, industry) -> BLOCKED_EDIT
+        - Edit attempts (budget, KPI, channels, customer, industry) -> BLOCKED_EDIT
+        - Allocation preferences / goal adjustments -> ALLOCATION_PREFERENCE (passes through)
         - Competitor changes -> BLOCKED_COMPETITOR
         - Rerun requests -> BLOCKED_RERUN
         - Everything else -> QUESTION (default to answering)
@@ -250,6 +253,11 @@ User message: {message}"""
                 confidence=result.confidence,
                 raw_response=result.raw_response,
             )
+
+        elif original_intent == IntentType.ALLOCATION_PREFERENCE:
+            # Allocation preferences pass through unblocked - they are picked up
+            # from chatSnapshot at the next rerun (preference extraction)
+            return result
 
         else:
             # UNKNOWN or anything else -> treat as question

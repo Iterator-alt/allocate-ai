@@ -378,21 +378,23 @@ class OutputParsingService:
             ))
             return None, issues
 
-        # Extract or calculate amount
-        amount = alloc.get("amount") or alloc.get("budget_gross_eur")
-        if amount is not None:
-            try:
-                amount = Decimal(str(amount))
-            except (InvalidOperation, ValueError):
-                issues.append(ValidationIssue(
-                    field=f"allocations[{index}].amount",
-                    message=f"Invalid amount value: {amount}",
-                    severity="warning"
-                ))
-                amount = None
-        elif total_budget is not None:
-            # Calculate amount from percentage
-            amount = (total_budget * percentage) / Decimal("100")
+        # Calculate amount from percentage when total budget is known.
+        # LLM-provided amounts can be inconsistent with the percentage, so they are
+        # ignored and only used as a fallback when no total budget is available.
+        if total_budget is not None:
+            amount = ((total_budget * percentage) / Decimal("100")).quantize(Decimal("0.01"))
+        else:
+            amount = alloc.get("amount") or alloc.get("budget_gross_eur")
+            if amount is not None:
+                try:
+                    amount = Decimal(str(amount))
+                except (InvalidOperation, ValueError):
+                    issues.append(ValidationIssue(
+                        field=f"allocations[{index}].amount",
+                        message=f"Invalid amount value: {amount}",
+                        severity="warning"
+                    ))
+                    amount = None
 
         # Extract rationale
         rationale = alloc.get("rationale") or alloc.get("reasoning")

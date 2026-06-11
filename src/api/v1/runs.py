@@ -58,6 +58,11 @@ from src.services.stage1 import (
 # Stage 2-4 AI Pipeline imports
 from src.services.llm_gateway.client import OpenAIClient
 from src.services.mediamix.prompt_assembly import PromptAssemblyService, PromptAssemblyInput
+from src.services.chat.preference_extraction import (
+    extract_chat_preferences,
+    build_preference_prompt_text,
+    apply_channel_adjustments,
+)
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -679,6 +684,18 @@ async def run_full_pipeline_background(
                 if budget_sum > 0:
                     total_budget = budget_sum
 
+            # Recalculate ALL budgets from final share_pct - LLM-provided amounts can be
+            # inconsistent with shares, and share post-processing above doesn't always
+            # recalculate budgets (e.g., missing-channel scaling with shares still at 100%)
+            if total_budget and allocations:
+                for a in allocations:
+                    a["budget_gross_eur"] = round(float(total_budget) * a["share_pct"] / 100, 2)
+                # Force exact match: put any rounding residue on the largest channel
+                residue = round(float(total_budget) - sum(a["budget_gross_eur"] for a in allocations), 2)
+                if residue:
+                    largest = max(allocations, key=lambda a: a["budget_gross_eur"])
+                    largest["budget_gross_eur"] = round(largest["budget_gross_eur"] + residue, 2)
+
             # Extract kpi_projection from LLM response - MUST NOT be null
             kpi_projection_raw = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
             kpi_projection = None
@@ -961,12 +978,22 @@ def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
 async def _run_stages_2_to_4_pipeline(
     prisma_ai_run_id: str,
     external_run_id: int,
+    previous_shares: Optional[dict] = None,
+    previous_completed_at: Optional[str] = None,
 ):
     """Run Stages 2-4 after competitor confirmation.
 
     This is called from the confirm endpoint after user approves competitors.
     Stage 1 data is read from competitorSnapshot in the database.
     Uses shared connection pool from src/db/session.py.
+
+    Args:
+        previous_shares: channel -> share_pct of the previous run's allocation
+            (captured before allocationResult is cleared); baseline for explicit
+            chat channel adjustments.
+        previous_completed_at: ISO timestamp of the previous run's completion;
+            only chat messages newer than this are considered for preference
+            extraction (older ones were already applied to the previous result).
     """
     from src.db.session import AsyncSessionLocal
 
@@ -1038,6 +1065,23 @@ async def _run_stages_2_to_4_pipeline(
                 additional_context = f"{additional_context}\n\n{channels_note}" if additional_context else channels_note
                 logger.info(f"[ExternalRunId {external_run_id}] media_channels_changed=True - adding channel update note to Stage 2 prompt")
 
+            # Extract net allocation preferences from chat (fail-open: None on error/empty)
+            chat_prefs = await extract_chat_preferences(
+                messages=(ai_run.chatSnapshot or {}).get("messages", []),
+                campaign_context={
+                    "customer_name": inputs.customer_name,
+                    "brand_kpi": inputs.brand_kpi,
+                    "channels": inputs.media_channels,
+                    "goal_mode": inputs.direction,
+                },
+                external_run_id=external_run_id,
+                since_timestamp=previous_completed_at,
+            )
+
+            # previous_shares (channel -> share_pct of the previous result) is passed in
+            # by the caller, captured before allocationResult was cleared
+            chat_prefs_text = build_preference_prompt_text(chat_prefs, previous_shares)
+
             prompt_input = PromptAssemblyInput(
                 customer_name=inputs.customer_name,
                 industry=inputs.industry,
@@ -1052,6 +1096,7 @@ async def _run_stages_2_to_4_pipeline(
                 goal_direction=inputs.direction,
                 goal_text=inputs.goal_text,
                 customer_historical_spend=customer_historical_spend,
+                chat_preferences=chat_prefs_text,
             )
 
             assembled_prompt = await prompt_service.assemble_prompt(
@@ -1225,6 +1270,16 @@ async def _run_stages_2_to_4_pipeline(
                         if total_budget_val and a["share_pct"] > 0:
                             a["budget_gross_eur"] = round(total_budget_val * a["share_pct"] / 100, 2)
 
+            # Deterministically enforce explicit "+/-X%" channel requests from chat:
+            # target = previous run share + delta_pp, other channels rebalanced proportionally
+            if chat_prefs and chat_prefs.channel_adjustments:
+                apply_channel_adjustments(
+                    allocations=allocations,
+                    adjustments=chat_prefs.channel_adjustments,
+                    previous_shares=previous_shares,
+                    external_run_id=external_run_id,
+                )
+
             # =================================================================
             # Stage 4: Store Results
             # =================================================================
@@ -1234,6 +1289,18 @@ async def _run_stages_2_to_4_pipeline(
                 budget_sum = sum(a["budget_gross_eur"] or 0 for a in allocations)
                 if budget_sum > 0:
                     total_budget_val = budget_sum
+
+            # Recalculate ALL budgets from final share_pct - LLM-provided amounts can be
+            # inconsistent with shares, and share post-processing above doesn't always
+            # recalculate budgets (e.g., missing-channel scaling with shares still at 100%)
+            if total_budget_val and allocations:
+                for a in allocations:
+                    a["budget_gross_eur"] = round(float(total_budget_val) * a["share_pct"] / 100, 2)
+                # Force exact match: put any rounding residue on the largest channel
+                residue = round(float(total_budget_val) - sum(a["budget_gross_eur"] for a in allocations), 2)
+                if residue:
+                    largest = max(allocations, key=lambda a: a["budget_gross_eur"])
+                    largest["budget_gross_eur"] = round(largest["budget_gross_eur"] + residue, 2)
 
             kpi_projection_raw = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
             kpi_projection = None
@@ -1401,6 +1468,19 @@ async def create_run(
         # Clear: allocationResult
         logger.info(f"[ExternalRunId {external_run_id}] Skipping Stage 1 - {skip_reason}")
 
+        # Capture previous shares BEFORE clearing allocationResult - they are the
+        # baseline for explicit "+/-X%" channel adjustments from chat
+        previous_shares = {
+            a.get("channel"): a.get("share_pct")
+            for a in ((ai_run.allocationResult or {}).get("allocations") or [])
+            if a.get("channel") and a.get("share_pct") is not None
+        }
+        # Capture previous completion time - chat preferences stated before it
+        # were already applied to the previous result and must not re-apply
+        previous_completed_at = (
+            ai_run.completedAt.isoformat() if ai_run.completedAt else None
+        )
+
         ai_run.status = "pending"
         ai_run.progressPct = 0
         ai_run.stage = None
@@ -1420,6 +1500,8 @@ async def create_run(
             _run_stages_2_to_4_pipeline,
             prisma_ai_run_id=ai_run.id,
             external_run_id=external_run_id,
+            previous_shares=previous_shares,
+            previous_completed_at=previous_completed_at,
         )
 
         logger.info(f"Run started (Stage 2-4 only) for externalRunId={external_run_id}")

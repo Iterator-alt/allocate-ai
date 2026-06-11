@@ -296,8 +296,12 @@ class ChatAgent:
                 "raw_response": classification.raw_response,
             })
 
+        # Acknowledge allocation preferences - applied at the next rerun
+        if first_intent == IntentType.ALLOCATION_PREFERENCE:
+            response_text = ("Got it - I've noted this preference. Click Generate in the "
+                             "Definition Area to rerun the allocation with it applied.")
         # Handle blocked intents with redirect messages
-        if first_intent == IntentType.BLOCKED_EDIT:
+        elif first_intent == IntentType.BLOCKED_EDIT:
             response_text = "Please update this in the Definition Area and click Generate to rerun the allocation."
         elif first_intent == IntentType.BLOCKED_COMPETITOR:
             response_text = "Please update your competitor selection in the competitor confirmation step and rerun from there."
@@ -405,6 +409,11 @@ class ChatAgent:
                         base_message += "\n\nHit Generate to apply your changes."
 
             return base_message
+
+        # Allocation preference - acknowledged, applied at the next rerun (no tool executed)
+        if intent == IntentType.ALLOCATION_PREFERENCE:
+            return ("Got it - I've noted this preference. Click Generate in the "
+                    "Definition Area to rerun the allocation with it applied.")
 
         # Unknown intent - ask for clarification
         if intent == IntentType.UNKNOWN:
