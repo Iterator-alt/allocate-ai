@@ -57,6 +57,7 @@ def _save_debug_file(
     step_name: str,
     data: Dict[str, Any],
     timestamp: Optional[datetime] = None,
+    filename_override: Optional[str] = None,
 ) -> Optional[str]:
     """Save debug data to a JSON file.
 
@@ -65,6 +66,8 @@ def _save_debug_file(
         step_name: Name of the step (e.g., "Y1_industry_resolution")
         data: Dictionary of data to save
         timestamp: Optional timestamp (defaults to now)
+        filename_override: If provided, use this as the filename instead of
+            generating one from timestamp + step_name
 
     Returns:
         Path to saved file, or None if debug mode is off
@@ -73,7 +76,6 @@ def _save_debug_file(
         return None
 
     timestamp = timestamp or datetime.now()
-    timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
 
     debug_dir = _get_debug_dir()
 
@@ -81,8 +83,12 @@ def _save_debug_file(
     run_dir = debug_dir / f"run_{run_id}"
     run_dir.mkdir(exist_ok=True)
 
-    # Build filename
-    filename = f"{timestamp_str}_{step_name}.json"
+    # Build filename - use override if provided, otherwise generate with timestamp
+    if filename_override:
+        filename = filename_override
+    else:
+        timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp_str}_{step_name}.json"
     filepath = run_dir / filename
 
     # Serialize and save
@@ -154,7 +160,10 @@ class Stage1DebugLogger:
             },
         }
 
-        filepath = _save_debug_file(self.run_id, "Y1_industry_resolution", data, self.start_time)
+        filepath = _save_debug_file(
+            self.run_id, "Y1_industry_resolution", data, self.start_time,
+            filename_override="01_industry_resolution.json"
+        )
         if filepath:
             self._saved_files.append(filepath)
         return filepath
@@ -200,7 +209,10 @@ class Stage1DebugLogger:
             },
         }
 
-        filepath = _save_debug_file(self.run_id, "Y2_brand_and_competitors", data, self.start_time)
+        filepath = _save_debug_file(
+            self.run_id, "Y2_brand_and_competitors", data, self.start_time,
+            filename_override="02_brand_competitors.json"
+        )
         if filepath:
             self._saved_files.append(filepath)
         return filepath
@@ -243,7 +255,10 @@ class Stage1DebugLogger:
             },
         }
 
-        filepath = _save_debug_file(self.run_id, "Y3_yougov_filtered_data", data, self.start_time)
+        filepath = _save_debug_file(
+            self.run_id, "Y3_yougov_filtered_data", data, self.start_time,
+            filename_override="03_yougov_filter.json"
+        )
         if filepath:
             self._saved_files.append(filepath)
         return filepath
@@ -290,7 +305,10 @@ class Stage1DebugLogger:
             },
         }
 
-        filepath = _save_debug_file(self.run_id, "N1_nielsen_produktmarke_filtering", data, self.start_time)
+        filepath = _save_debug_file(
+            self.run_id, "N1_nielsen_produktmarke_filtering", data, self.start_time,
+            filename_override="04_nielsen_filter.json"
+        )
         if filepath:
             self._saved_files.append(filepath)
         return filepath
@@ -339,7 +357,10 @@ class Stage1DebugLogger:
             },
         }
 
-        filepath = _save_debug_file(self.run_id, "FINAL_filtered_data", data, self.start_time)
+        filepath = _save_debug_file(
+            self.run_id, "FINAL_filtered_data", data, self.start_time,
+            filename_override="05_filtered_data.json"
+        )
         if filepath:
             self._saved_files.append(filepath)
         return filepath

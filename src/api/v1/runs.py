@@ -26,8 +26,8 @@ from typing import Optional, List
 from decimal import Decimal
 from dataclasses import dataclass
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks, Query
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -498,7 +498,7 @@ async def run_full_pipeline_background(
             if get_settings().stage1_debug_mode:
                 debug_dir = f"debug_output/run_{external_run_id}"
                 os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/S2_llm_response.txt", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/06_llm_response.txt", "w", encoding="utf-8") as f:
                     f.write("=== RAW LLM RESPONSE ===\n")
                     f.write(f"Model: {llm_response.model}\n")
                     f.write(f"Total Tokens: {llm_response.total_tokens}\n")
@@ -521,7 +521,7 @@ async def run_full_pipeline_background(
 
             # DEBUG: Save parsed allocation (raw from LLM before post-processing)
             if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/S2_parsed_raw.json", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
 
             # Build allocation result
@@ -726,7 +726,7 @@ async def run_full_pipeline_background(
 
             # DEBUG: Save final result (after post-processing)
             if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/S2_final_result.json", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/08_final_result.json", "w", encoding="utf-8") as f:
                     json.dump(allocation_result, f, indent=2, ensure_ascii=False)
                 logger.info(f"[ExternalRunId {external_run_id}] Debug files saved to {debug_dir}/")
 
@@ -1132,7 +1132,7 @@ async def _run_stages_2_to_4_pipeline(
             if get_settings().stage1_debug_mode:
                 debug_dir = f"debug_output/run_{external_run_id}"
                 os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/S2_llm_response.txt", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/06_llm_response.txt", "w", encoding="utf-8") as f:
                     f.write("=== RAW LLM RESPONSE ===\n")
                     f.write(f"Model: {llm_response.model}\n")
                     f.write(f"Total Tokens: {llm_response.total_tokens}\n")
@@ -1154,7 +1154,7 @@ async def _run_stages_2_to_4_pipeline(
 
             # DEBUG: Save parsed allocation
             if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/S2_parsed_raw.json", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
 
             # Build allocation result (same logic as main pipeline)
@@ -1328,7 +1328,7 @@ async def _run_stages_2_to_4_pipeline(
 
             # DEBUG: Save final result and create ZIP
             if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/S2_final_result.json", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/08_final_result.json", "w", encoding="utf-8") as f:
                     json.dump(allocation_result, f, indent=2, ensure_ascii=False)
                 logger.info(f"[ExternalRunId {external_run_id}] Debug files saved to {debug_dir}/")
 
@@ -1658,33 +1658,97 @@ async def get_run_result(
     return ai_run.allocationResult
 
 
+# Debug file mapping: n -> filename
+DEBUG_FILE_MAP = {
+    1: "01_industry_resolution.json",
+    2: "02_brand_competitors.json",
+    3: "03_yougov_filter.json",
+    4: "04_nielsen_filter.json",
+    5: "05_filtered_data.json",
+    6: "06_llm_response.txt",
+    7: "07_parsed_response.json",
+    8: "08_final_result.json",
+}
+
+
 @router.get(
     "/{run_id}/debug-zip",
     responses={
-        200: {"description": "Debug ZIP file download", "content": {"application/zip": {}}},
-        404: {"model": ErrorResponse, "description": "Debug ZIP not found"},
+        200: {"description": "Debug file content"},
+        400: {"model": ErrorResponse, "description": "Missing or invalid n parameter"},
+        404: {"model": ErrorResponse, "description": "Debug file not found"},
     },
 )
-async def download_debug_zip(
+async def get_debug_file(
     request: Request,
     run_id: int,
+    n: Optional[int] = Query(None, description="File number 1-8"),
 ):
-    """Download the debug ZIP file for a run.
+    """Get a specific debug file for a run.
 
     The run_id is the externalRunId from ProjectVersionAiRun.
-    Returns the debug ZIP file if it exists.
+    The n parameter specifies which debug file to return:
+      1 = 01_industry_resolution.json (Stage 1)
+      2 = 02_brand_competitors.json (Stage 1)
+      3 = 03_yougov_filter.json (Stage 1)
+      4 = 04_nielsen_filter.json (Stage 1)
+      5 = 05_filtered_data.json (Stage 1)
+      6 = 06_llm_response.txt (Stage 2)
+      7 = 07_parsed_response.json (Stage 2)
+      8 = 08_final_result.json (Stage 2)
+
+    Files 1-5 only exist for runs that executed Stage 1 (full pipeline).
+    Files 6-8 exist for all completed runs.
     Debug files are only created when STAGE1_DEBUG_MODE=True.
     """
-    zip_path = f"debug_output/run_{run_id}.zip"
-
-    if not os.path.exists(zip_path):
+    # Validate n parameter
+    if n is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Debug ZIP for run {run_id} not found. Debug mode may be disabled or run hasn't completed.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Parameter n is required. Provide a number between 1-8 to get a specific debug file.",
         )
 
-    return FileResponse(
-        path=zip_path,
-        media_type="application/zip",
-        filename=f"run_{run_id}_debug.zip",
-    )
+    if n not in DEBUG_FILE_MAP:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid n value. Must be 1-8.",
+        )
+
+    filename = DEBUG_FILE_MAP[n]
+    content = None
+
+    # First try the run directory (in-progress runs)
+    run_dir = f"debug_output/run_{run_id}"
+    file_path = f"{run_dir}/{filename}"
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    else:
+        # Try inside the ZIP (completed runs)
+        zip_path = f"debug_output/run_{run_id}.zip"
+        if os.path.exists(zip_path):
+            try:
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    if filename in z.namelist():
+                        content = z.read(filename).decode("utf-8")
+            except (zipfile.BadZipFile, KeyError):
+                pass
+
+    if content is None:
+        # File not found - provide helpful error message
+        if n <= 5:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File n={n} not available for this run — Stage 1 was skipped.",
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File n={n} not found. Debug mode may be disabled or run hasn't completed.",
+            )
+
+    # Return with appropriate content type
+    if filename.endswith(".json"):
+        return Response(content=content, media_type="application/json")
+    else:
+        return Response(content=content, media_type="text/plain")
