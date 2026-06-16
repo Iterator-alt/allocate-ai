@@ -27,7 +27,7 @@ from decimal import Decimal
 from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, BackgroundTasks, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -63,6 +63,8 @@ from src.services.chat.preference_extraction import (
     build_preference_prompt_text,
     apply_channel_adjustments,
 )
+from src.services.warnings import build_warnings_from_context
+from src.services.errors import humanize_error, get_error_title
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -353,7 +355,9 @@ async def run_full_pipeline_background(
             project_version = await get_project_version(session, ai_run.projectVersionId)
             if not project_version:
                 logger.error(f"ProjectVersion {ai_run.projectVersionId} not found")
-                await _update_ai_run_status(session, ai_run, "failed", error="ProjectVersion not found")
+                error_msg = "Project configuration not found. Please contact support."
+                await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
             # Extract campaign inputs
@@ -379,9 +383,11 @@ async def run_full_pipeline_background(
             stage1_result = await orchestrator.process(user_input, run_id=str(external_run_id))
 
             if stage1_result.status == Stage1Status.FAILED:
-                error_msg = "; ".join(stage1_result.errors) if stage1_result.errors else "Stage 1 failed"
+                raw_error = "; ".join(stage1_result.errors) if stage1_result.errors else "Stage 1 failed"
+                error_msg = humanize_error(raw_error)
                 await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
-                logger.error(f"[ExternalRunId {external_run_id}] Stage 1 failed: {error_msg}")
+                await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
+                logger.error(f"[ExternalRunId {external_run_id}] Stage 1 failed: {raw_error}")
                 return
 
             # Store competitor data
@@ -395,9 +401,10 @@ async def run_full_pipeline_background(
             # Validate that we have competitors before proceeding
             snapshot_competitors = competitor_snapshot.get("competitors", []) if competitor_snapshot else []
             if not snapshot_competitors:
-                error_msg = "Stage 1 failed: No competitors found for the given brand and industry"
+                error_msg = "No competitors found for the given brand and industry. Please check your inputs."
                 logger.error(f"[ExternalRunId {external_run_id}] {error_msg}")
                 await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
             ai_run.competitorSnapshot = competitor_snapshot
@@ -474,7 +481,7 @@ async def run_full_pipeline_background(
             if get_settings().stage1_debug_mode:
                 debug_dir = f"debug_output/run_{external_run_id}"
                 os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/S2_prompt.txt", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/06_prompt.txt", "w", encoding="utf-8") as f:
                     f.write("=== SYSTEM PROMPT ===\n")
                     f.write(assembled_prompt.system_prompt)
                     f.write("\n\n=== USER PROMPT ===\n")
@@ -516,7 +523,10 @@ async def run_full_pipeline_background(
             try:
                 parsed_allocation = json.loads(llm_response.content)
             except json.JSONDecodeError as e:
-                await _update_ai_run_status(session, ai_run, "failed", error=f"Failed to parse LLM response: {e}")
+                logger.error(f"[ExternalRunId {external_run_id}] Failed to parse LLM response: {e}")
+                error_msg = "Could not process AI response. Please try running again."
+                await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
             # DEBUG: Save parsed allocation (raw from LLM before post-processing)
@@ -711,6 +721,21 @@ async def run_full_pipeline_background(
                 logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return kpi_projection, defaulting to 0.0")
                 kpi_projection = 0.0
 
+            # Build structured warnings from context
+            # Identify competitors excluded due to missing Nielsen data
+            excluded_competitors = [
+                c.brand_label for c in stage1_result.competitors
+                if c.nielsen_brand is None
+            ] if stage1_result and stage1_result.competitors else []
+
+            structured_warnings = build_warnings_from_context(
+                parsed_allocation=parsed_allocation,
+                total_budget=float(total_budget) if total_budget else None,
+                competitor_data=[c for c in stage1_result.competitors if c.nielsen_brand] if stage1_result else [],
+                historical_spend=customer_historical_spend,
+                excluded_competitors=excluded_competitors,
+            )
+
             allocation_result = {
                 "run_id": external_run_id,
                 "allocations": allocations,
@@ -718,7 +743,7 @@ async def run_full_pipeline_background(
                 "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
                 "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
-                "warnings": parsed_allocation.get("warnings", []),
+                "warnings": structured_warnings,
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
@@ -766,6 +791,7 @@ async def run_full_pipeline_background(
 
         except Exception as e:
             logger.error(f"[ExternalRunId {external_run_id}] Pipeline failed: {str(e)}", exc_info=True)
+            human_error = humanize_error(str(e))
             try:
                 await session.rollback()
                 # Try to update status to failed
@@ -775,9 +801,12 @@ async def run_full_pipeline_background(
                 result = await session.execute(query)
                 ai_run = result.scalar_one_or_none()
                 if ai_run:
-                    await _update_ai_run_status(session, ai_run, "failed", error=str(e))
+                    await _update_ai_run_status(session, ai_run, "failed", error=human_error)
             except Exception as e2:
                 logger.error(f"Failed to update status after error: {e2}")
+
+            # Insert run_failed card into chatSnapshot (uses separate session)
+            await _insert_error_card(prisma_ai_run_id, external_run_id, human_error)
 
 
 def _build_allocation_summary(allocation_result: dict) -> str:
@@ -864,16 +893,31 @@ async def _insert_feedback_cards(
             cards_to_insert = []
             timestamp = datetime.utcnow().isoformat()
 
-            # 1. Warning cards (if any)
+            # 1. Warning cards (if any) — now with structured color/title/description
             warnings = allocation_result.get("warnings", [])
             for i, warning in enumerate(warnings):
-                cards_to_insert.append({
-                    "id": f"warning_{i}",
-                    "role": "system",
-                    "card_type": "warning",
-                    "content": warning,
-                    "created_at": timestamp,
-                })
+                # Handle both structured warnings (dict) and legacy string warnings
+                if isinstance(warning, dict):
+                    cards_to_insert.append({
+                        "id": f"warning_{i}",
+                        "role": "system",
+                        "card_type": "warning",
+                        "color": warning.get("color", "yellow"),
+                        "title": warning.get("title", "Warning"),
+                        "description": warning.get("description", ""),
+                        "created_at": timestamp,
+                    })
+                else:
+                    # Legacy string warning — convert to structured
+                    cards_to_insert.append({
+                        "id": f"warning_{i}",
+                        "role": "system",
+                        "card_type": "warning",
+                        "color": "yellow",
+                        "title": "Notice",
+                        "description": str(warning),
+                        "created_at": timestamp,
+                    })
 
             # 2. Allocation summary card
             summary_content = _build_allocation_summary(allocation_result)
@@ -923,6 +967,69 @@ async def _insert_feedback_cards(
         # Do not raise - feedback cards are non-critical, pipeline should complete regardless
 
 
+async def _insert_error_card(
+    ai_run_id: str,
+    external_run_id: int,
+    error_message: str,
+) -> None:
+    """Insert run_failed card into chatSnapshot when run fails.
+
+    Creates a red error card with the human-readable error message.
+    Removes any previous error cards to avoid duplicates.
+
+    Uses a FRESH database session to completely isolate from pipeline ORM state.
+    """
+    from sqlalchemy import update
+    from src.db.session import async_session_factory
+
+    try:
+        logger.info(f"[ExternalRunId {external_run_id}] Inserting run_failed card into chatSnapshot")
+
+        async with async_session_factory() as fresh_session:
+            # Get existing chatSnapshot
+            query = select(PrismaProjectVersionAiRun.chatSnapshot).where(
+                PrismaProjectVersionAiRun.id == ai_run_id
+            )
+            result = await fresh_session.execute(query)
+            existing_snapshot = result.scalar_one_or_none()
+            existing_messages = existing_snapshot.get("messages", []) if existing_snapshot else []
+
+            # Remove any previous error cards to avoid duplicates
+            existing_messages = [
+                msg for msg in existing_messages
+                if not (msg.get("role") == "system" and msg.get("card_type") == "run_failed")
+            ]
+
+            timestamp = datetime.utcnow().isoformat()
+            error_card = {
+                "id": "error_0",
+                "role": "system",
+                "card_type": "run_failed",
+                "color": "red",
+                "title": get_error_title(error_message),
+                "description": error_message,
+                "created_at": timestamp,
+            }
+
+            chat_snapshot = {
+                "messages": [error_card] + existing_messages,
+                "updated_at": timestamp,
+            }
+
+            # Use direct SQL UPDATE
+            stmt = update(PrismaProjectVersionAiRun).where(
+                PrismaProjectVersionAiRun.id == ai_run_id
+            ).values(chatSnapshot=chat_snapshot)
+            await fresh_session.execute(stmt)
+            await fresh_session.commit()
+
+            logger.info(f"[ExternalRunId {external_run_id}] Inserted run_failed card into chatSnapshot")
+
+    except Exception as e:
+        logger.error(f"[ExternalRunId {external_run_id}] Failed to insert error card: {e}", exc_info=True)
+        # Do not raise - error cards are non-critical
+
+
 async def _update_ai_run_status(
     session: AsyncSession,
     ai_run: PrismaProjectVersionAiRun,
@@ -940,6 +1047,7 @@ async def _update_ai_run_status(
     if progress_pct is not None:
         ai_run.progressPct = progress_pct
     if error is not None:
+        # Error message should already be humanized by caller
         ai_run.errorMessage = error
     if status == "matching":
         ai_run.startedAt = datetime.utcnow()
@@ -1014,7 +1122,9 @@ async def _run_stages_2_to_4_pipeline(
             project_version = await get_project_version(session, ai_run.projectVersionId)
             if not project_version:
                 logger.error(f"ProjectVersion {ai_run.projectVersionId} not found")
-                await _update_ai_run_status(session, ai_run, "failed", error="ProjectVersion not found")
+                error_msg = "Project configuration not found. Please contact support."
+                await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
             # Extract campaign inputs
@@ -1108,7 +1218,7 @@ async def _run_stages_2_to_4_pipeline(
             if get_settings().stage1_debug_mode:
                 debug_dir = f"debug_output/run_{external_run_id}"
                 os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/S2_prompt.txt", "w", encoding="utf-8") as f:
+                with open(f"{debug_dir}/06_prompt.txt", "w", encoding="utf-8") as f:
                     f.write("=== SYSTEM PROMPT ===\n")
                     f.write(assembled_prompt.system_prompt)
                     f.write("\n\n=== USER PROMPT ===\n")
@@ -1149,7 +1259,10 @@ async def _run_stages_2_to_4_pipeline(
             try:
                 parsed_allocation = json.loads(llm_response.content)
             except json.JSONDecodeError as e:
-                await _update_ai_run_status(session, ai_run, "failed", error=f"Failed to parse LLM response: {e}")
+                logger.error(f"[ExternalRunId {external_run_id}] Failed to parse LLM response: {e}")
+                error_msg = "Could not process AI response. Please try running again."
+                await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
+                await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
             # DEBUG: Save parsed allocation
@@ -1313,6 +1426,23 @@ async def _run_stages_2_to_4_pipeline(
             if kpi_projection is None:
                 kpi_projection = 0.0
 
+            # Build structured warnings from context
+            # Get competitor info from snapshot (Stage 2-4 pipeline doesn't have stage1_result)
+            snapshot_competitors = (ai_run.competitorSnapshot or {}).get("competitors", [])
+            excluded_competitors = [
+                c.get("yougov_brand_label") for c in snapshot_competitors
+                if not c.get("has_nielsen_data") and c.get("yougov_brand_label")
+            ]
+            competitors_with_data = [c for c in snapshot_competitors if c.get("has_nielsen_data")]
+
+            structured_warnings = build_warnings_from_context(
+                parsed_allocation=parsed_allocation,
+                total_budget=float(total_budget_val) if total_budget_val else None,
+                competitor_data=competitors_with_data,
+                historical_spend=None,  # Not available in Stage 2-4 only path
+                excluded_competitors=excluded_competitors,
+            )
+
             allocation_result = {
                 "run_id": external_run_id,
                 "allocations": allocations,
@@ -1320,7 +1450,7 @@ async def _run_stages_2_to_4_pipeline(
                 "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
                 "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
-                "warnings": parsed_allocation.get("warnings", []),
+                "warnings": structured_warnings,
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
@@ -1366,6 +1496,7 @@ async def _run_stages_2_to_4_pipeline(
 
         except Exception as e:
             logger.error(f"[ExternalRunId {external_run_id}] Stage 2-4 pipeline failed: {str(e)}", exc_info=True)
+            human_error = humanize_error(str(e))
             try:
                 await session.rollback()
                 query = select(PrismaProjectVersionAiRun).where(
@@ -1374,9 +1505,12 @@ async def _run_stages_2_to_4_pipeline(
                 result = await session.execute(query)
                 ai_run = result.scalar_one_or_none()
                 if ai_run:
-                    await _update_ai_run_status(session, ai_run, "failed", error=str(e))
+                    await _update_ai_run_status(session, ai_run, "failed", error=human_error)
             except Exception as e2:
                 logger.error(f"Failed to update status after error: {e2}")
+
+            # Insert run_failed card into chatSnapshot (uses separate session)
+            await _insert_error_card(prisma_ai_run_id, external_run_id, human_error)
 
 
 # =============================================================================
@@ -1443,9 +1577,14 @@ async def create_run(
     inputs = extract_campaign_inputs(project_version)
 
     # Determine if Stage 1 can be skipped
-    # Priority: frontend flag > auto-detection
-    if run_request.definition_changed is not None:
-        # Frontend explicitly told us
+    # Priority: skip_competitor_fetch > definition_changed > auto-detection
+    if run_request.skip_competitor_fetch:
+        # Highest priority: frontend explicitly wants to skip Stage 1 and keep existing competitors
+        can_skip_stage1 = True
+        skip_reason = "skip_competitor_fetch flag set by frontend"
+        logger.info(f"[ExternalRunId {external_run_id}] Skipping Stage 1 — skip_competitor_fetch flag set by frontend")
+    elif run_request.definition_changed is not None:
+        # Frontend explicitly told us via definition_changed
         can_skip_stage1 = not run_request.definition_changed
         skip_reason = "frontend flag" if can_skip_stage1 else "frontend flag (definition_changed=true)"
     else:
@@ -1658,97 +1797,138 @@ async def get_run_result(
     return ai_run.allocationResult
 
 
-# Debug file mapping: n -> filename
-DEBUG_FILE_MAP = {
-    1: "01_industry_resolution.json",
-    2: "02_brand_competitors.json",
-    3: "03_yougov_filter.json",
-    4: "04_nielsen_filter.json",
-    5: "05_filtered_data.json",
-    6: "06_llm_response.txt",
-    7: "07_parsed_response.json",
-    8: "08_final_result.json",
+# Debug bundle mapping: n -> list of files in bundle
+DEBUG_BUNDLE_MAP = {
+    1: [  # Stage 1 Data Discovery
+        "01_industry_resolution.json",
+        "02_brand_competitors.json",
+        "03_yougov_filter.json",
+        "04_nielsen_filter.json",
+        "Y1_prompt.txt",
+        "Y2_prompt.txt",
+        "N1_prompt.txt",
+    ],
+    2: [  # Filtered Data and LLM Input
+        "05_filtered_data.json",
+        "06_prompt.txt",
+        "06_llm_response.txt",
+    ],
+    3: [  # Allocation Output
+        "07_parsed_response.json",
+        "08_final_result.json",
+    ],
 }
+
+# Files that indicate Stage 1 was run (for n=1 and n=2 bundles)
+STAGE1_INDICATOR_FILES = ["01_industry_resolution.json", "05_filtered_data.json"]
 
 
 @router.get(
     "/{run_id}/debug-zip",
     responses={
-        200: {"description": "Debug file content"},
+        200: {"description": "Debug bundle ZIP", "content": {"application/zip": {}}},
         400: {"model": ErrorResponse, "description": "Missing or invalid n parameter"},
-        404: {"model": ErrorResponse, "description": "Debug file not found"},
+        404: {"model": ErrorResponse, "description": "Debug bundle not found"},
     },
 )
-async def get_debug_file(
+async def get_debug_bundle(
     request: Request,
     run_id: int,
-    n: Optional[int] = Query(None, description="File number 1-8"),
+    n: Optional[int] = Query(None, description="Bundle number 1-3"),
 ):
-    """Get a specific debug file for a run.
+    """Get a debug bundle ZIP for a run.
 
     The run_id is the externalRunId from ProjectVersionAiRun.
-    The n parameter specifies which debug file to return:
-      1 = 01_industry_resolution.json (Stage 1)
-      2 = 02_brand_competitors.json (Stage 1)
-      3 = 03_yougov_filter.json (Stage 1)
-      4 = 04_nielsen_filter.json (Stage 1)
-      5 = 05_filtered_data.json (Stage 1)
-      6 = 06_llm_response.txt (Stage 2)
-      7 = 07_parsed_response.json (Stage 2)
-      8 = 08_final_result.json (Stage 2)
+    The n parameter specifies which bundle to return:
+      1 = Stage 1 Data Discovery (industry resolution, brand/competitors, filters, prompts)
+      2 = Filtered Data & LLM Input (filtered data, Stage 2 prompt, LLM response)
+      3 = Allocation Output (parsed response, final result)
 
-    Files 1-5 only exist for runs that executed Stage 1 (full pipeline).
-    Files 6-8 exist for all completed runs.
+    Bundles 1-2 only exist for runs that executed Stage 1 (full pipeline).
+    Bundle 3 exists for all completed runs.
     Debug files are only created when STAGE1_DEBUG_MODE=True.
     """
+    import io
+
     # Validate n parameter
     if n is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Parameter n is required. Provide a number between 1-8 to get a specific debug file.",
+            detail="Parameter n is required. Must be 1, 2, or 3.",
         )
 
-    if n not in DEBUG_FILE_MAP:
+    if n not in DEBUG_BUNDLE_MAP:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid n value. Must be 1-8.",
+            detail="Invalid n value. Must be 1, 2, or 3.",
         )
 
-    filename = DEBUG_FILE_MAP[n]
-    content = None
+    bundle_files = DEBUG_BUNDLE_MAP[n]
+    collected_files: dict[str, bytes] = {}
 
-    # First try the run directory (in-progress runs)
     run_dir = f"debug_output/run_{run_id}"
-    file_path = f"{run_dir}/{filename}"
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-    else:
-        # Try inside the ZIP (completed runs)
-        zip_path = f"debug_output/run_{run_id}.zip"
-        if os.path.exists(zip_path):
+    zip_path = f"debug_output/run_{run_id}.zip"
+
+    # Collect files from run directory or ZIP
+    for filename in bundle_files:
+        content = None
+        file_path = f"{run_dir}/{filename}"
+
+        # First try run directory (in-progress runs)
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                content = f.read()
+        # Then try inside the ZIP (completed runs)
+        elif os.path.exists(zip_path):
             try:
                 with zipfile.ZipFile(zip_path, "r") as z:
                     if filename in z.namelist():
-                        content = z.read(filename).decode("utf-8")
+                        content = z.read(filename)
             except (zipfile.BadZipFile, KeyError):
                 pass
 
-    if content is None:
-        # File not found - provide helpful error message
-        if n <= 5:
+        if content is not None:
+            collected_files[filename] = content
+
+    # Check if we have any files
+    if not collected_files:
+        if n in (1, 2):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"File n={n} not available for this run — Stage 1 was skipped.",
+                detail=f"Bundle n={n} not available for this run — Stage 1 was skipped.",
             )
         else:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"File n={n} not found. Debug mode may be disabled or run hasn't completed.",
+                detail=f"Bundle n={n} not found. Debug mode may be disabled or run hasn't completed.",
             )
 
-    # Return with appropriate content type
-    if filename.endswith(".json"):
-        return Response(content=content, media_type="application/json")
-    else:
-        return Response(content=content, media_type="text/plain")
+    # For bundle 1 and 2, check if Stage 1 files exist (indicator that Stage 1 ran)
+    if n == 1:
+        if "01_industry_resolution.json" not in collected_files:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Bundle n={n} not available for this run — Stage 1 was skipped.",
+            )
+    elif n == 2:
+        if "05_filtered_data.json" not in collected_files:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Bundle n={n} not available for this run — Stage 1 was skipped.",
+            )
+
+    # Create in-memory ZIP with collected files
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, content in collected_files.items():
+            zf.writestr(filename, content)
+    zip_buffer.seek(0)
+
+    bundle_names = {1: "stage1_discovery", 2: "filtered_data_llm", 3: "allocation_output"}
+    zip_filename = f"run_{run_id}_{bundle_names[n]}.zip"
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_filename}"},
+    )
