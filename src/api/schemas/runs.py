@@ -108,6 +108,10 @@ class StartRunRequest(BaseModel):
 
     run_id: int = Field(..., description="The externalRunId from ProjectVersionAiRun")
     action: str = Field(..., pattern="^start$", description="Must be 'start'")
+    skip_competitor_fetch: Optional[bool] = Field(
+        None,
+        description="Frontend flag: True=skip Stage 1 and keep existing competitors. Takes priority over definition_changed."
+    )
     definition_changed: Optional[bool] = Field(
         None,
         description="Frontend flag: True=run full Stage 1-4, False=skip Stage 1. If not sent, auto-detect."
