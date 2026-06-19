@@ -153,6 +153,7 @@ class AIResolutionService:
         user_industry: str,
         yougov_sectors: List[str],
         nielsen_sectors: List[str],
+        debug_logger: Optional[Any] = None,
     ) -> IndustryResolutionResult:
         """AI Call #1: Map user's industry input to database sector values.
 
@@ -183,6 +184,10 @@ YouGov sectors: {json.dumps(yougov_sectors[:100], ensure_ascii=False)}
 Nielsen sectors: {json.dumps(nielsen_sectors[:100], ensure_ascii=False)}
 
 Map the user's industry to matching sectors from both lists."""
+
+        # Save prompt for debugging
+        if debug_logger:
+            debug_logger.save_y1_prompt(system_prompt, user_prompt)
 
         try:
             response = await self.client.chat.completions.create(
@@ -578,6 +583,7 @@ Score each candidate on similarity to the target profile."""
         brand_kpi: str,
         max_competitors: int = 10,
         customer_nielsen_brand: Optional[str] = None,
+        debug_logger: Optional[Any] = None,
     ) -> CompetitorSuggestionResult:
         """AI Call #5: Suggest direct competitors from available brands.
 
@@ -631,6 +637,10 @@ Identify which brands are DIRECT COMPETITORS to {customer_brand}.
 Focus on brands in the SAME PRODUCT CATEGORY (e.g., if customer sells yogurt, only include other yogurt brands).
 Return maximum {max_competitors} competitors, most relevant first."""
 
+        # Save prompt for debugging
+        if debug_logger:
+            debug_logger.save_y2_prompt(system_prompt, user_prompt)
+
         try:
             response = await self.client.chat.completions.create(
                 model=self.MODEL,
@@ -672,6 +682,7 @@ Return maximum {max_competitors} competitors, most relevant first."""
         customer_brand: str,
         nielsen_marke: str,
         produktmarke_list: List[str],
+        debug_logger: Optional[Any] = None,
     ) -> ProduktmarkeFilterResult:
         """AI Call #6: Filter relevant Produktmarke sub-brands.
 
@@ -715,6 +726,10 @@ Nielsen has these Produktmarke (sub-brand) entries under {nielsen_marke}:
 {json.dumps(produktmarke_list[:50], ensure_ascii=False)}
 
 Determine which Produktmarke entries are RELEVANT for analyzing media spend for "{customer_brand}"."""
+
+        # Save prompt for debugging
+        if debug_logger:
+            debug_logger.save_n1_prompt(system_prompt, user_prompt)
 
         try:
             response = await self.client.chat.completions.create(

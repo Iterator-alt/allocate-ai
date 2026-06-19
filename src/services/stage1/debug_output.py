@@ -395,3 +395,48 @@ class Stage1DebugLogger:
         if not self.enabled:
             return None
         return str(_get_debug_dir() / f"run_{self.run_id}")
+
+    def save_y1_prompt(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Save Y1 (Industry Resolution) AI prompt."""
+        if not self.enabled:
+            return None
+        run_dir = _get_debug_dir() / f"run_{self.run_id}"
+        run_dir.mkdir(exist_ok=True)
+        filepath = run_dir / "Y1_prompt.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=== SYSTEM PROMPT ===\n")
+            f.write(system_prompt)
+            f.write("\n\n=== USER PROMPT ===\n")
+            f.write(user_prompt)
+        self._saved_files.append(str(filepath))
+        return str(filepath)
+
+    def save_y2_prompt(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Save Y2 (Brand and Competitor Suggestion) AI prompt."""
+        if not self.enabled:
+            return None
+        run_dir = _get_debug_dir() / f"run_{self.run_id}"
+        run_dir.mkdir(exist_ok=True)
+        filepath = run_dir / "Y2_prompt.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=== SYSTEM PROMPT ===\n")
+            f.write(system_prompt)
+            f.write("\n\n=== USER PROMPT ===\n")
+            f.write(user_prompt)
+        self._saved_files.append(str(filepath))
+        return str(filepath)
+
+    def save_n1_prompt(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Save N1 (Produktmarke Filtering) AI prompt."""
+        if not self.enabled:
+            return None
+        run_dir = _get_debug_dir() / f"run_{self.run_id}"
+        run_dir.mkdir(exist_ok=True)
+        filepath = run_dir / "N1_prompt.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=== SYSTEM PROMPT ===\n")
+            f.write(system_prompt)
+            f.write("\n\n=== USER PROMPT ===\n")
+            f.write(user_prompt)
+        self._saved_files.append(str(filepath))
+        return str(filepath)

@@ -105,6 +105,9 @@ Customer has a gross budget of €{total_budget:,.2f}. Recommend how to split th
 ## Competitor Spend & KPI Data
 {data_context}
 
+## Reference Information
+{expert_knowledge}
+
 ## ALLOCATION RULES (Data-Driven)
 1. Calculate the total competitor spend per channel from the data above
 2. Use competitor channel mix ratios as your starting point for allocation percentages
@@ -155,6 +158,9 @@ No fixed budget — calculate the required budget based on competitor spend effi
 
 ## Competitor Spend & KPI Data
 {data_context}
+
+## Reference Information
+{expert_knowledge}
 
 ## CRITICAL: BUDGET CALCULATION RULES
 

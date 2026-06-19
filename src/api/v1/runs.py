@@ -157,8 +157,8 @@ NIELSEN_TO_UI_CHANNEL_MAP = {
     "PLAKAT": "OOH",
     "RADIO": "Radio",
     "SOCIAL": "Social",
-    "ZEITUNGEN": "Print",  # Newspapers -> Print
-    "PUBLIKUMSZEITSCHRIFTEN": "Print",  # Magazines -> Print
+    "ZEITUNGEN": "Newspapers",
+    "PUBLIKUMSZEITSCHRIFTEN": "Magazines",
     "FACHZEITSCHRIFTEN": "Trade Press",
     "AT-RETAIL-MEDIA": "Retail Media",
     "SEARCH": "Search",
@@ -169,11 +169,12 @@ NIELSEN_TO_UI_CHANNEL_MAP = {
 }
 
 # Reverse mapping: UI names → Nielsen names (for filtering)
-# Note: "Print" maps to multiple Nielsen channels
 UI_TO_NIELSEN_CHANNEL_MAP = {
     "TV": "FERNSEHEN",
     "Digital": "ONLINE",
+    "Online": "ONLINE",  # Alternative UI name for Digital
     "OOH": "PLAKAT",
+    "Out-of-Home": "PLAKAT",  # Alternative UI name for OOH
     "Radio": "RADIO",
     "Social": "SOCIAL",
     "Print": ["ZEITUNGEN", "PUBLIKUMSZEITSCHRIFTEN"],  # Print maps to multiple
@@ -186,6 +187,101 @@ UI_TO_NIELSEN_CHANNEL_MAP = {
     "Transport": "TRANSPORT MEDIA",
     "Ambient": "AMBIENT MEDIA",
     "Direct Mail": "WERBESENDUNGEN",
+}
+
+# Comprehensive channel name normalization map
+# Maps ALL known variants (German, English, abbreviations, LLM outputs) to canonical UI names
+# Keys should be UPPERCASE for case-insensitive lookup
+CHANNEL_NORMALIZATION_MAP = {
+    # TV variants
+    "TV": "TV",
+    "TELEVISION": "TV",
+    "FERNSEHEN": "TV",
+
+    # Online/Digital variants - UI uses "Online"
+    "DIGITAL": "Online",
+    "ONLINE": "Online",
+    "INTERNET": "Online",
+
+    # OOH variants - UI uses "Out-of-Home"
+    "OOH": "Out-of-Home",
+    "OUT OF HOME": "Out-of-Home",
+    "OUT-OF-HOME": "Out-of-Home",
+    "OUTDOOR": "Out-of-Home",
+    "PLAKAT": "Out-of-Home",
+    "PLAAT": "Out-of-Home",  # Common LLM typo for PLAKAT
+    "BILLBOARD": "Out-of-Home",
+    "BILLBOARDS": "Out-of-Home",
+
+    # Radio variants
+    "RADIO": "Radio",
+
+    # Social variants
+    "SOCIAL": "Social",
+    "SOCIAL MEDIA": "Social",
+    "SOCIALMEDIA": "Social",
+
+    # Newspapers variants
+    "NEWSPAPERS": "Newspapers",
+    "NEWSPAPER": "Newspapers",
+    "ZEITUNGEN": "Newspapers",
+    "ZEITUNG": "Newspapers",
+    "NEWS": "Newspapers",
+    "PRINT NEWS": "Newspapers",
+
+    # Magazines variants
+    "MAGAZINES": "Magazines",
+    "MAGAZINE": "Magazines",
+    "PUBLIKUMSZEITSCHRIFTEN": "Magazines",
+    "ZEITSCHRIFTEN": "Magazines",
+    "ZEITSCHRIFT": "Magazines",
+    "CONSUMER MAGAZINES": "Magazines",
+
+    # Print (generic - maps to both newspapers and magazines context)
+    "PRINT": "Print",
+
+    # Trade Press variants
+    "TRADE PRESS": "Trade Press",
+    "TRADE": "Trade Press",
+    "FACHZEITSCHRIFTEN": "Trade Press",
+    "TRADE PUBLICATIONS": "Trade Press",
+    "B2B": "Trade Press",
+
+    # Retail Media variants
+    "RETAIL MEDIA": "Retail Media",
+    "RETAIL": "Retail Media",
+    "AT-RETAIL-MEDIA": "Retail Media",
+    "POS": "Retail Media",
+    "POINT OF SALE": "Retail Media",
+
+    # Search variants
+    "SEARCH": "Search",
+    "SEM": "Search",
+    "PAID SEARCH": "Search",
+
+    # Cinema variants
+    "CINEMA": "Cinema",
+    "KINO": "Cinema",
+    "MOVIE": "Cinema",
+    "MOVIES": "Cinema",
+
+    # Transport variants
+    "TRANSPORT": "Transport",
+    "TRANSPORT MEDIA": "Transport",
+    "TRANSIT": "Transport",
+    "TRANSIT ADVERTISING": "Transport",
+
+    # Ambient variants
+    "AMBIENT": "Ambient",
+    "AMBIENT MEDIA": "Ambient",
+    "EXPERIENTIAL": "Ambient",
+
+    # Direct Mail variants
+    "DIRECT MAIL": "Direct Mail",
+    "DIRECTMAIL": "Direct Mail",
+    "WERBESENDUNGEN": "Direct Mail",
+    "DM": "Direct Mail",
+    "MAIL": "Direct Mail",
 }
 
 
@@ -209,6 +305,184 @@ def get_allowed_nielsen_channels(ui_channels: List[str]) -> set:
             # If no mapping found, allow exact match (case-insensitive)
             allowed.add(ui_channel.upper())
     return allowed
+
+
+def _normalize_channel_name(channel: str) -> str:
+    """Normalize a channel name for comparison.
+
+    Handles case-insensitive matching and maps all known variants
+    (German Nielsen names, English names, abbreviations, LLM outputs)
+    to canonical UI names.
+    """
+    channel_upper = channel.strip().upper()
+
+    # Use comprehensive normalization map (handles all variants)
+    normalized = CHANNEL_NORMALIZATION_MAP.get(channel_upper)
+    if normalized:
+        return normalized
+
+    # Fallback: try Nielsen to UI mapping
+    ui_name = NIELSEN_TO_UI_CHANNEL_MAP.get(channel_upper)
+    if ui_name:
+        return ui_name
+
+    # Return original with title case as last resort
+    return channel.strip().title()
+
+
+def _check_allocation_validity(
+    parsed_allocation: dict,
+    user_channels: set,
+    external_run_id: int,
+) -> tuple:
+    """
+    Check if LLM allocation output is valid.
+
+    Validates:
+    1. All user-selected channels are present
+    2. No extra channels that user didn't select
+    3. Percentages sum to 100% (within 1% tolerance)
+    4. kpi_projection is present and not null
+    5. confidence_score is present and not null
+
+    Returns:
+        Tuple of (is_valid: bool, errors: List[str])
+    """
+    errors = []
+    allocations = parsed_allocation.get("allocations", parsed_allocation.get("channels", []))
+
+    # Normalize user channels to canonical UI names using the same normalization
+    normalized_user_channels = set()
+    for ch in user_channels:
+        normalized_user_channels.add(_normalize_channel_name(ch))
+
+    # Get output channels (normalized to UI names)
+    output_channels = set()
+    for alloc in allocations:
+        channel = alloc.get("channel", alloc.get("name", ""))
+        normalized = _normalize_channel_name(channel)
+        output_channels.add(normalized)
+
+    # Check for missing channels
+    missing = normalized_user_channels - output_channels
+    if missing:
+        errors.append(f"Missing channels: {', '.join(sorted(missing))}")
+
+    # Check for extra channels (only if user specified channels)
+    if user_channels:
+        extra = output_channels - normalized_user_channels
+        if extra:
+            errors.append(f"Extra channels not requested: {', '.join(sorted(extra))}")
+
+    # Check sum (within 1% tolerance)
+    total = sum(
+        float(alloc.get("share_pct", alloc.get("percentage", 0)) or 0)
+        for alloc in allocations
+    )
+    if abs(total - 100.0) > 1.0:
+        errors.append(f"Allocation sum is {total:.1f}% (expected 100%)")
+
+    # Check kpi_projection (must be present and not null)
+    kpi_proj = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
+    if kpi_proj is None:
+        errors.append("kpi_projection is missing or null")
+
+    # Check confidence (must be present and not null)
+    confidence = parsed_allocation.get("confidence", parsed_allocation.get("confidence_score"))
+    if confidence is None:
+        errors.append("confidence_score is missing or null")
+
+    is_valid = len(errors) == 0
+    if not is_valid:
+        logger.warning(f"[ExternalRunId {external_run_id}] Allocation validation failed: {errors}")
+
+    return is_valid, errors
+
+
+async def _retry_llm_allocation(
+    llm_client,
+    assembled_prompt,
+    external_run_id: int,
+) -> tuple:
+    """
+    Retry LLM call for allocation.
+
+    Returns:
+        Tuple of (parsed_allocation: dict or None, success: bool)
+    """
+    logger.info(f"[ExternalRunId {external_run_id}] Retrying LLM allocation call...")
+
+    try:
+        llm_response = await llm_client.generate(
+            system_prompt=assembled_prompt.system_prompt,
+            user_prompt=assembled_prompt.user_prompt,
+            temperature=0.3,  # Lower temperature for retry
+            max_tokens=4096,
+            json_mode=True,
+        )
+
+        logger.info(f"[ExternalRunId {external_run_id}] Retry LLM response: {llm_response.total_tokens} tokens")
+
+        parsed_allocation = json.loads(llm_response.content)
+        return parsed_allocation, True
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[ExternalRunId {external_run_id}] Retry failed - JSON parse error: {e}")
+        return None, False
+    except Exception as e:
+        logger.error(f"[ExternalRunId {external_run_id}] Retry failed - error: {e}")
+        return None, False
+
+
+def _check_guardrail_violations(
+    allocations: list,
+    external_run_id: int,
+) -> list:
+    """
+    Check allocations against guardrail guidelines.
+    Returns warnings for violations but does NOT modify values.
+
+    Guidelines:
+    - Minimum 5% per channel
+    - Maximum 60% single channel
+    - At least 3 channels allocated
+    """
+    warnings = []
+
+    # Guideline: Minimum 5% per channel
+    for alloc in allocations:
+        share = alloc.get("share_pct", 0)
+        channel = alloc.get("channel", "Unknown")
+        if 0 < share < 5.0:
+            logger.info(f"[ExternalRunId {external_run_id}] Guardrail: {channel} at {share}% (below 5% guideline)")
+            warnings.append({
+                "color": "yellow",
+                "title": "Low Allocation",
+                "description": f"{channel} allocated {share:.1f}% (below 5% guideline). Value shown as-is per AI recommendation.",
+            })
+
+    # Guideline: Maximum 60% single channel
+    for alloc in allocations:
+        share = alloc.get("share_pct", 0)
+        channel = alloc.get("channel", "Unknown")
+        if share > 60.0:
+            logger.info(f"[ExternalRunId {external_run_id}] Guardrail: {channel} at {share}% (above 60% guideline)")
+            warnings.append({
+                "color": "yellow",
+                "title": "High Concentration",
+                "description": f"{channel} allocated {share:.1f}% (above 60% guideline). Value shown as-is per AI recommendation.",
+            })
+
+    # Guideline: At least 3 channels
+    if len(allocations) < 3:
+        logger.info(f"[ExternalRunId {external_run_id}] Guardrail: Only {len(allocations)} channels (guideline suggests 3+)")
+        warnings.append({
+            "color": "yellow",
+            "title": "Limited Diversification",
+            "description": f"Only {len(allocations)} channel(s) allocated (guideline suggests 3+). Allocation shown as-is per AI recommendation.",
+        })
+
+    return warnings
 
 
 async def get_ai_run_by_external_id(db: AsyncSession, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
@@ -445,8 +719,16 @@ async def run_full_pipeline_background(
             # Get customer's historical spend from Stage 1 data
             # NOTE: Despite the name 'total_spend_teuro', it's already converted to EUR in repository.py
             customer_historical_spend = None
+            historical_spend_warning = None
             if stage1_result.brand_data and stage1_result.brand_data.total_spend_teuro:
                 customer_historical_spend = stage1_result.brand_data.total_spend_teuro  # Already in EUR
+            else:
+                logger.warning(f"[ExternalRunId {external_run_id}] Historical spend not available from Stage 1")
+                historical_spend_warning = {
+                    "color": "yellow",
+                    "title": "Historical Spend Unavailable",
+                    "description": "Customer's historical spend data not available. Budget recommendations may be less anchored to customer's typical scale.",
+                }
 
             # Inform Stage 2 prompt if the user changed media channels for this run
             additional_context = inputs.goal_text
@@ -534,12 +816,74 @@ async def run_full_pipeline_background(
                 with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
 
+            # Get user-selected channels for validation
+            user_channels = inputs.media_channels or []
+            user_channels_set = set(user_channels)
+
+            # =================================================================
+            # Validation & Retry Logic
+            # =================================================================
+            validation_warnings = []
+            did_retry = False
+
+            # Validate allocation output
+            is_valid, validation_errors = _check_allocation_validity(
+                parsed_allocation, user_channels_set, external_run_id
+            )
+
+            if not is_valid:
+                # Retry LLM call (max 1 retry)
+                logger.warning(f"[ExternalRunId {external_run_id}] Allocation invalid, attempting retry...")
+                retry_result, retry_success = await _retry_llm_allocation(
+                    llm_client, assembled_prompt, external_run_id
+                )
+
+                if retry_success and retry_result:
+                    did_retry = True
+                    parsed_allocation = retry_result
+
+                    # DEBUG: Save retry response
+                    if get_settings().stage1_debug_mode:
+                        with open(f"{debug_dir}/07_parsed_response_retry.json", "w", encoding="utf-8") as f:
+                            json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
+                    # Re-validate after retry
+                    is_valid_after_retry, validation_errors_after_retry = _check_allocation_validity(
+                        parsed_allocation, user_channels_set, external_run_id
+                    )
+
+                    if not is_valid_after_retry:
+                        # Still invalid after retry - add warnings
+                        validation_warnings.append({
+                            "color": "yellow",
+                            "title": "Allocation Regenerated",
+                            "description": "AI allocation was regenerated due to output inconsistencies.",
+                        })
+                        for error in validation_errors_after_retry:
+                            validation_warnings.append({
+                                "color": "yellow",
+                                "title": "Allocation Issue",
+                                "description": error,
+                            })
+                else:
+                    # Retry failed - add warnings for original errors
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Allocation Retry Failed",
+                        "description": "AI allocation regeneration failed. Using original output with adjustments.",
+                    })
+                    for error in validation_errors:
+                        validation_warnings.append({
+                            "color": "yellow",
+                            "title": "Allocation Issue",
+                            "description": error,
+                        })
+
             # Build allocation result
             allocations = []
             channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
 
-            # Get user-selected channels and map to allowed Nielsen channel names
-            user_channels = inputs.media_channels or []
+            # Map to allowed Nielsen channel names
             allowed_nielsen_channels = get_allowed_nielsen_channels(user_channels)
             logger.info(f"[ExternalRunId {external_run_id}] User channels: {user_channels} -> Allowed Nielsen: {allowed_nielsen_channels}")
 
@@ -555,13 +899,13 @@ async def run_full_pipeline_background(
                 # Get Nielsen channel name from LLM response
                 nielsen_channel = channel.get("name", channel.get("channel", "Unknown"))
 
-                # Filter: Only include channels the user selected
-                if allowed_nielsen_channels and nielsen_channel.upper() not in allowed_nielsen_channels:
-                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} - not in user selection")
-                    continue
+                # Normalize channel name to UI name FIRST (handles all German/English variants)
+                ui_channel = _normalize_channel_name(nielsen_channel)
 
-                # Map Nielsen channel name to user-facing UI name
-                ui_channel = map_nielsen_channel_to_ui(nielsen_channel)
+                # Filter: Only include channels the user selected (compare UI names)
+                if user_channels_set and ui_channel not in user_channels_set:
+                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} -> {ui_channel} - not in user selection {user_channels_set}")
+                    continue
 
                 # Get share percentage - handle various field names
                 share_pct = float(
@@ -617,23 +961,11 @@ async def run_full_pipeline_background(
             allocations = list(channel_map.values())
             logger.info(f"[ExternalRunId {external_run_id}] After deduplication: {len(allocations)} unique channels")
 
-            # Step 2: Normalize user_channels to canonical UI names for comparison
-            # This handles cases where user selected "Online" which maps to "Digital"
-            normalized_user_channels = set()
-            for ch in user_channels:
-                # Check if user channel is a Nielsen name that should be mapped
-                nielsen_upper = ch.upper()
-                if nielsen_upper in NIELSEN_TO_UI_CHANNEL_MAP:
-                    # User used Nielsen name, map to UI name
-                    normalized_user_channels.add(NIELSEN_TO_UI_CHANNEL_MAP[nielsen_upper])
-                elif ch in UI_TO_NIELSEN_CHANNEL_MAP:
-                    # User used UI name, keep as-is
-                    normalized_user_channels.add(ch)
-                else:
-                    # Unknown channel, keep original
-                    normalized_user_channels.add(ch)
+            # Step 2: Use user_channels directly - they are already canonical UI names
+            # No need to normalize since user input comes from UI dropdown
+            normalized_user_channels = set(user_channels)
 
-            logger.info(f"[ExternalRunId {external_run_id}] User channels normalized: {user_channels} -> {normalized_user_channels}")
+            logger.info(f"[ExternalRunId {external_run_id}] User channels: {normalized_user_channels}")
 
             # Step 3: Normalize shares to 100% if needed
             total_share = sum(a["share_pct"] for a in allocations)
@@ -647,32 +979,24 @@ async def run_full_pipeline_background(
                         a["budget_gross_eur"] = round(total_budget * a["share_pct"] / 100, 2)
 
             # Step 4: Check for missing user-selected channels (using normalized names)
+            # NOTE: Do NOT fabricate allocations for missing channels.
+            # Instead, add warnings explaining why they were excluded.
             allocated_channels = {a["channel"] for a in allocations}
             missing_channels = normalized_user_channels - allocated_channels
 
             if missing_channels:
-                logger.warning(f"[ExternalRunId {external_run_id}] Missing user-selected channels: {missing_channels}")
-                # Add missing channels with minimal allocation (5% each, taken proportionally from existing)
+                logger.warning(f"[ExternalRunId {external_run_id}] Channels excluded (no AI allocation): {missing_channels}")
                 for missing_ch in missing_channels:
-                    min_allocation = 5.0
-                    # Reduce existing allocations proportionally to make room
-                    reduction_factor = (100.0 - min_allocation) / 100.0 if allocations else 1.0
-                    for a in allocations:
-                        a["share_pct"] = round(a["share_pct"] * reduction_factor, 2)
-
-                    # Calculate budget for missing channel
-                    missing_budget = round(total_budget * min_allocation / 100, 2) if total_budget else None
-
-                    allocations.append({
-                        "channel": missing_ch,
-                        "share_pct": min_allocation,
-                        "budget_gross_eur": missing_budget,
-                        "reasoning": f"No competitor benchmark data available for {missing_ch}. Allocated minimum 5% as part of user's selected channel mix.",
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Channel Excluded",
+                        "description": f"{missing_ch} was not allocated by AI — insufficient benchmark data for this channel.",
                     })
 
-                # Re-normalize to ensure exactly 100%
+                # Re-normalize remaining allocations to 100% (don't add missing channels)
                 total_share = sum(a["share_pct"] for a in allocations)
                 if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                    logger.info(f"[ExternalRunId {external_run_id}] Normalizing {total_share}% to 100% after excluding missing channels")
                     scale_factor = 100.0 / total_share
                     for a in allocations:
                         a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
@@ -715,11 +1039,46 @@ async def run_full_pipeline_background(
                 except (TypeError, ValueError):
                     logger.warning(f"[ExternalRunId {external_run_id}] Could not parse kpi_projection: {kpi_projection_raw}")
                     kpi_projection = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "KPI Projection Invalid",
+                        "description": "AI returned invalid KPI projection value. Defaulting to 0.",
+                    })
 
-            # If LLM didn't return kpi_projection, estimate based on mode
+            # If LLM didn't return kpi_projection after retry, default to 0 with warning
             if kpi_projection is None:
                 logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return kpi_projection, defaulting to 0.0")
                 kpi_projection = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "KPI Projection Unavailable",
+                    "description": "AI could not estimate KPI impact. Defaulting to 0 (no projected change).",
+                })
+
+            # Extract confidence_score from LLM response
+            confidence_raw = parsed_allocation.get("confidence", parsed_allocation.get("confidence_score"))
+            confidence_score = None
+            if confidence_raw is not None:
+                try:
+                    confidence_score = float(confidence_raw)
+                except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse confidence: {confidence_raw}")
+                    confidence_score = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Confidence Score Invalid",
+                        "description": "AI returned invalid confidence value. Defaulting to 0.",
+                    })
+
+            # If LLM didn't return confidence after retry, default to 0 with warning
+            if confidence_score is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return confidence, defaulting to 0.0")
+                confidence_score = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "Confidence Score Unavailable",
+                    "description": "AI could not assess confidence level. Defaulting to 0 (low confidence).",
+                })
 
             # Build structured warnings from context
             # Identify competitors excluded due to missing Nielsen data
@@ -736,13 +1095,24 @@ async def run_full_pipeline_background(
                 excluded_competitors=excluded_competitors,
             )
 
+            # Add validation warnings (from retry logic, missing channels, etc.)
+            structured_warnings.extend(validation_warnings)
+
+            # Add historical spend warning if applicable
+            if historical_spend_warning:
+                structured_warnings.append(historical_spend_warning)
+
+            # Check guardrail violations (warnings only, values not modified)
+            guardrail_warnings = _check_guardrail_violations(allocations, external_run_id)
+            structured_warnings.extend(guardrail_warnings)
+
             allocation_result = {
                 "run_id": external_run_id,
                 "allocations": allocations,
                 "total_budget_eur": total_budget,
                 "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
-                "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
+                "confidence_score": confidence_score,  # Use extracted/defaulted value, not raw
                 "warnings": structured_warnings,
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),
@@ -1077,6 +1447,8 @@ def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
             "nielsen_brand": result.confirmed_brand.nielsen_brand if result.confirmed_brand else None,
             "match_type": result.confirmed_brand.match_type.value if result.confirmed_brand else None,
             "confidence": result.confirmed_brand.confidence if result.confirmed_brand else None,
+            # Historical spend from brand data (already in EUR despite the name)
+            "total_spend_teuro": result.brand_data.total_spend_teuro if result.brand_data else None,
         } if result.confirmed_brand else None,
         "yougov_sectors": result.yougov_sectors,
         "nielsen_sectors": result.nielsen_sectors,
@@ -1154,8 +1526,24 @@ async def _run_stages_2_to_4_pipeline(
 
             logger.info(f"[ExternalRunId {external_run_id}] Confirmed: YouGov={yougov_brands}, Nielsen={nielsen_brands}")
 
-            # Customer historical spend - not available in Stage 2-4 standalone pipeline
+            # Extract customer historical spend from competitorSnapshot (set during Stage 1)
             customer_historical_spend = None
+            historical_spend_warning = None
+            brand_info = (ai_run.competitorSnapshot or {}).get("brand_info")
+            if brand_info:
+                # total_spend_teuro was stored during Stage 1
+                customer_historical_spend = brand_info.get("total_spend_teuro")
+                if customer_historical_spend:
+                    logger.info(f"[ExternalRunId {external_run_id}] Using historical spend from snapshot: {customer_historical_spend}")
+
+            # If still None, prepare warning for later
+            if customer_historical_spend is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] Historical spend not available")
+                historical_spend_warning = {
+                    "color": "yellow",
+                    "title": "Historical Spend Unavailable",
+                    "description": "Customer's historical spend data not available. Budget recommendations may be less anchored to customer's typical scale.",
+                }
 
             # =================================================================
             # Stage 2: AI Allocation Generation
@@ -1270,11 +1658,73 @@ async def _run_stages_2_to_4_pipeline(
                 with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
                     json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
 
+            # Get user-selected channels for validation
+            user_channels = inputs.media_channels or []
+            user_channels_set = set(user_channels)
+
+            # =================================================================
+            # Validation & Retry Logic
+            # =================================================================
+            validation_warnings = []
+            did_retry = False
+
+            # Validate allocation output
+            is_valid, validation_errors = _check_allocation_validity(
+                parsed_allocation, user_channels_set, external_run_id
+            )
+
+            if not is_valid:
+                # Retry LLM call (max 1 retry)
+                logger.warning(f"[ExternalRunId {external_run_id}] Allocation invalid, attempting retry...")
+                retry_result, retry_success = await _retry_llm_allocation(
+                    llm_client, assembled_prompt, external_run_id
+                )
+
+                if retry_success and retry_result:
+                    did_retry = True
+                    parsed_allocation = retry_result
+
+                    # DEBUG: Save retry response
+                    if get_settings().stage1_debug_mode:
+                        with open(f"{debug_dir}/07_parsed_response_retry.json", "w", encoding="utf-8") as f:
+                            json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
+                    # Re-validate after retry
+                    is_valid_after_retry, validation_errors_after_retry = _check_allocation_validity(
+                        parsed_allocation, user_channels_set, external_run_id
+                    )
+
+                    if not is_valid_after_retry:
+                        # Still invalid after retry - add warnings
+                        validation_warnings.append({
+                            "color": "yellow",
+                            "title": "Allocation Regenerated",
+                            "description": "AI allocation was regenerated due to output inconsistencies.",
+                        })
+                        for error in validation_errors_after_retry:
+                            validation_warnings.append({
+                                "color": "yellow",
+                                "title": "Allocation Issue",
+                                "description": error,
+                            })
+                else:
+                    # Retry failed - add warnings for original errors
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Allocation Retry Failed",
+                        "description": "AI allocation regeneration failed. Using original output with adjustments.",
+                    })
+                    for error in validation_errors:
+                        validation_warnings.append({
+                            "color": "yellow",
+                            "title": "Allocation Issue",
+                            "description": error,
+                        })
+
             # Build allocation result (same logic as main pipeline)
             allocations = []
             channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
 
-            user_channels = inputs.media_channels or []
             allowed_nielsen_channels = get_allowed_nielsen_channels(user_channels)
 
             total_budget_val = inputs.total_budget
@@ -1286,10 +1736,13 @@ async def _run_stages_2_to_4_pipeline(
             for channel in channels_data:
                 nielsen_channel = channel.get("name", channel.get("channel", "Unknown"))
 
-                if allowed_nielsen_channels and nielsen_channel.upper() not in allowed_nielsen_channels:
-                    continue
+                # Normalize channel name to UI name FIRST (handles all German/English variants)
+                ui_channel = _normalize_channel_name(nielsen_channel)
 
-                ui_channel = map_nielsen_channel_to_ui(nielsen_channel)
+                # Filter: Only include channels the user selected (compare UI names)
+                if user_channels_set and ui_channel not in user_channels_set:
+                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} -> {ui_channel} - not in user selection")
+                    continue
 
                 share_pct = float(
                     channel.get("percentage") or
@@ -1334,16 +1787,8 @@ async def _run_stages_2_to_4_pipeline(
 
             allocations = list(channel_map.values())
 
-            # Normalize user channels
-            normalized_user_channels = set()
-            for ch in user_channels:
-                nielsen_upper = ch.upper()
-                if nielsen_upper in NIELSEN_TO_UI_CHANNEL_MAP:
-                    normalized_user_channels.add(NIELSEN_TO_UI_CHANNEL_MAP[nielsen_upper])
-                elif ch in UI_TO_NIELSEN_CHANNEL_MAP:
-                    normalized_user_channels.add(ch)
-                else:
-                    normalized_user_channels.add(ch)
+            # Use user_channels directly - they are already canonical UI names
+            normalized_user_channels = set(user_channels)
 
             # Normalize shares to 100%
             total_share = sum(a["share_pct"] for a in allocations)
@@ -1354,29 +1799,24 @@ async def _run_stages_2_to_4_pipeline(
                     if total_budget_val and a["share_pct"] > 0:
                         a["budget_gross_eur"] = round(total_budget_val * a["share_pct"] / 100, 2)
 
-            # Add missing channels
+            # Check for missing channels - do NOT fabricate allocations
+            # Instead, add warnings explaining why they were excluded
             allocated_channels = {a["channel"] for a in allocations}
             missing_channels = normalized_user_channels - allocated_channels
 
             if missing_channels:
+                logger.warning(f"[ExternalRunId {external_run_id}] Channels excluded (no AI allocation): {missing_channels}")
                 for missing_ch in missing_channels:
-                    min_allocation = 5.0
-                    reduction_factor = (100.0 - min_allocation) / 100.0 if allocations else 1.0
-                    for a in allocations:
-                        a["share_pct"] = round(a["share_pct"] * reduction_factor, 2)
-
-                    missing_budget = round(total_budget_val * min_allocation / 100, 2) if total_budget_val else None
-
-                    allocations.append({
-                        "channel": missing_ch,
-                        "share_pct": min_allocation,
-                        "budget_gross_eur": missing_budget,
-                        "reasoning": f"No competitor benchmark data available for {missing_ch}. Allocated minimum 5%.",
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Channel Excluded",
+                        "description": f"{missing_ch} was not allocated by AI — insufficient benchmark data for this channel.",
                     })
 
-                # Re-normalize
+                # Re-normalize remaining allocations to 100% (don't add missing channels)
                 total_share = sum(a["share_pct"] for a in allocations)
                 if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                    logger.info(f"[ExternalRunId {external_run_id}] Normalizing {total_share}% to 100% after excluding missing channels")
                     scale_factor = 100.0 / total_share
                     for a in allocations:
                         a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
@@ -1415,16 +1855,55 @@ async def _run_stages_2_to_4_pipeline(
                     largest = max(allocations, key=lambda a: a["budget_gross_eur"])
                     largest["budget_gross_eur"] = round(largest["budget_gross_eur"] + residue, 2)
 
+            # Extract kpi_projection from LLM response
             kpi_projection_raw = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
             kpi_projection = None
             if kpi_projection_raw is not None:
                 try:
                     kpi_projection = float(kpi_projection_raw)
                 except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse kpi_projection: {kpi_projection_raw}")
                     kpi_projection = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "KPI Projection Invalid",
+                        "description": "AI returned invalid KPI projection value. Defaulting to 0.",
+                    })
 
+            # If LLM didn't return kpi_projection after retry, default to 0 with warning
             if kpi_projection is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return kpi_projection, defaulting to 0.0")
                 kpi_projection = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "KPI Projection Unavailable",
+                    "description": "AI could not estimate KPI impact. Defaulting to 0 (no projected change).",
+                })
+
+            # Extract confidence_score from LLM response
+            confidence_raw = parsed_allocation.get("confidence", parsed_allocation.get("confidence_score"))
+            confidence_score = None
+            if confidence_raw is not None:
+                try:
+                    confidence_score = float(confidence_raw)
+                except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse confidence: {confidence_raw}")
+                    confidence_score = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Confidence Score Invalid",
+                        "description": "AI returned invalid confidence value. Defaulting to 0.",
+                    })
+
+            # If LLM didn't return confidence after retry, default to 0 with warning
+            if confidence_score is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return confidence, defaulting to 0.0")
+                confidence_score = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "Confidence Score Unavailable",
+                    "description": "AI could not assess confidence level. Defaulting to 0 (low confidence).",
+                })
 
             # Build structured warnings from context
             # Get competitor info from snapshot (Stage 2-4 pipeline doesn't have stage1_result)
@@ -1439,9 +1918,20 @@ async def _run_stages_2_to_4_pipeline(
                 parsed_allocation=parsed_allocation,
                 total_budget=float(total_budget_val) if total_budget_val else None,
                 competitor_data=competitors_with_data,
-                historical_spend=None,  # Not available in Stage 2-4 only path
+                historical_spend=customer_historical_spend,  # Now extracted from snapshot
                 excluded_competitors=excluded_competitors,
             )
+
+            # Add validation warnings (from retry logic, missing channels, etc.)
+            structured_warnings.extend(validation_warnings)
+
+            # Add historical spend warning if applicable
+            if historical_spend_warning:
+                structured_warnings.append(historical_spend_warning)
+
+            # Check guardrail violations (warnings only, values not modified)
+            guardrail_warnings = _check_guardrail_violations(allocations, external_run_id)
+            structured_warnings.extend(guardrail_warnings)
 
             allocation_result = {
                 "run_id": external_run_id,
@@ -1449,7 +1939,7 @@ async def _run_stages_2_to_4_pipeline(
                 "total_budget_eur": total_budget_val,
                 "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
-                "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
+                "confidence_score": confidence_score,  # Use extracted/defaulted value, not raw
                 "warnings": structured_warnings,
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),

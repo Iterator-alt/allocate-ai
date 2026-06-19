@@ -116,6 +116,10 @@ class StartRunRequest(BaseModel):
         None,
         description="Frontend flag: True=user changed media channels. Informational only - never affects Stage 1 skip; passed to Stage 2 prompt."
     )
+    skip_competitor_fetch: Optional[bool] = Field(
+        None,
+        description="Frontend flag: True=skip Stage 1 entirely regardless of definition_changed, use existing confirmedCompetitors from DB."
+    )
 
 
 class StartRunResponse(BaseModel):
