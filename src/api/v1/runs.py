@@ -4,6 +4,7 @@ Endpoints:
 - POST /runs - Start a new generation run (accepts {run_id, action: "start"})
 - GET /runs/{id}/status - Poll run state from ProjectVersionAiRun
 - GET /runs/{id}/result - Get allocation result from ProjectVersionAiRun
+- GET /runs/{id}/artifacts - Run metrics and artifact download availability
 - GET /runs/{id}/debug-zip - Download debug ZIP file (requires STAGE1_DEBUG_MODE=True)
 
 Flow:
@@ -39,6 +40,9 @@ from src.api.schemas import (
     ErrorResponse,
     StartRunRequest,
     StartRunResponse,
+    RunArtifactsResponse,
+    RunArtifactStatus,
+    RunArtifactFileStatus,
 )
 from src.api.middleware import (
     get_session_context,
@@ -157,8 +161,8 @@ NIELSEN_TO_UI_CHANNEL_MAP = {
     "PLAKAT": "OOH",
     "RADIO": "Radio",
     "SOCIAL": "Social",
-    "ZEITUNGEN": "Print",  # Newspapers -> Print
-    "PUBLIKUMSZEITSCHRIFTEN": "Print",  # Magazines -> Print
+    "ZEITUNGEN": "Newspapers",
+    "PUBLIKUMSZEITSCHRIFTEN": "Magazines",
     "FACHZEITSCHRIFTEN": "Trade Press",
     "AT-RETAIL-MEDIA": "Retail Media",
     "SEARCH": "Search",
@@ -169,11 +173,12 @@ NIELSEN_TO_UI_CHANNEL_MAP = {
 }
 
 # Reverse mapping: UI names → Nielsen names (for filtering)
-# Note: "Print" maps to multiple Nielsen channels
 UI_TO_NIELSEN_CHANNEL_MAP = {
     "TV": "FERNSEHEN",
     "Digital": "ONLINE",
+    "Online": "ONLINE",  # Alternative UI name for Digital
     "OOH": "PLAKAT",
+    "Out-of-Home": "PLAKAT",  # Alternative UI name for OOH
     "Radio": "RADIO",
     "Social": "SOCIAL",
     "Print": ["ZEITUNGEN", "PUBLIKUMSZEITSCHRIFTEN"],  # Print maps to multiple
@@ -186,6 +191,101 @@ UI_TO_NIELSEN_CHANNEL_MAP = {
     "Transport": "TRANSPORT MEDIA",
     "Ambient": "AMBIENT MEDIA",
     "Direct Mail": "WERBESENDUNGEN",
+}
+
+# Comprehensive channel name normalization map
+# Maps ALL known variants (German, English, abbreviations, LLM outputs) to canonical UI names
+# Keys should be UPPERCASE for case-insensitive lookup
+CHANNEL_NORMALIZATION_MAP = {
+    # TV variants
+    "TV": "TV",
+    "TELEVISION": "TV",
+    "FERNSEHEN": "TV",
+
+    # Online/Digital variants - UI uses "Online"
+    "DIGITAL": "Online",
+    "ONLINE": "Online",
+    "INTERNET": "Online",
+
+    # OOH variants - UI uses "Out-of-Home"
+    "OOH": "Out-of-Home",
+    "OUT OF HOME": "Out-of-Home",
+    "OUT-OF-HOME": "Out-of-Home",
+    "OUTDOOR": "Out-of-Home",
+    "PLAKAT": "Out-of-Home",
+    "PLAAT": "Out-of-Home",  # Common LLM typo for PLAKAT
+    "BILLBOARD": "Out-of-Home",
+    "BILLBOARDS": "Out-of-Home",
+
+    # Radio variants
+    "RADIO": "Radio",
+
+    # Social variants
+    "SOCIAL": "Social",
+    "SOCIAL MEDIA": "Social",
+    "SOCIALMEDIA": "Social",
+
+    # Newspapers variants
+    "NEWSPAPERS": "Newspapers",
+    "NEWSPAPER": "Newspapers",
+    "ZEITUNGEN": "Newspapers",
+    "ZEITUNG": "Newspapers",
+    "NEWS": "Newspapers",
+    "PRINT NEWS": "Newspapers",
+
+    # Magazines variants
+    "MAGAZINES": "Magazines",
+    "MAGAZINE": "Magazines",
+    "PUBLIKUMSZEITSCHRIFTEN": "Magazines",
+    "ZEITSCHRIFTEN": "Magazines",
+    "ZEITSCHRIFT": "Magazines",
+    "CONSUMER MAGAZINES": "Magazines",
+
+    # Print (generic - maps to both newspapers and magazines context)
+    "PRINT": "Print",
+
+    # Trade Press variants
+    "TRADE PRESS": "Trade Press",
+    "TRADE": "Trade Press",
+    "FACHZEITSCHRIFTEN": "Trade Press",
+    "TRADE PUBLICATIONS": "Trade Press",
+    "B2B": "Trade Press",
+
+    # Retail Media variants
+    "RETAIL MEDIA": "Retail Media",
+    "RETAIL": "Retail Media",
+    "AT-RETAIL-MEDIA": "Retail Media",
+    "POS": "Retail Media",
+    "POINT OF SALE": "Retail Media",
+
+    # Search variants
+    "SEARCH": "Search",
+    "SEM": "Search",
+    "PAID SEARCH": "Search",
+
+    # Cinema variants
+    "CINEMA": "Cinema",
+    "KINO": "Cinema",
+    "MOVIE": "Cinema",
+    "MOVIES": "Cinema",
+
+    # Transport variants
+    "TRANSPORT": "Transport",
+    "TRANSPORT MEDIA": "Transport",
+    "TRANSIT": "Transport",
+    "TRANSIT ADVERTISING": "Transport",
+
+    # Ambient variants
+    "AMBIENT": "Ambient",
+    "AMBIENT MEDIA": "Ambient",
+    "EXPERIENTIAL": "Ambient",
+
+    # Direct Mail variants
+    "DIRECT MAIL": "Direct Mail",
+    "DIRECTMAIL": "Direct Mail",
+    "WERBESENDUNGEN": "Direct Mail",
+    "DM": "Direct Mail",
+    "MAIL": "Direct Mail",
 }
 
 
@@ -209,6 +309,335 @@ def get_allowed_nielsen_channels(ui_channels: List[str]) -> set:
             # If no mapping found, allow exact match (case-insensitive)
             allowed.add(ui_channel.upper())
     return allowed
+
+
+def _normalize_channel_name(channel: str) -> str:
+    """Normalize a channel name for comparison.
+
+    Handles case-insensitive matching and maps all known variants
+    (German Nielsen names, English names, abbreviations, LLM outputs)
+    to canonical UI names.
+    """
+    channel_upper = channel.strip().upper()
+
+    # Use comprehensive normalization map (handles all variants)
+    normalized = CHANNEL_NORMALIZATION_MAP.get(channel_upper)
+    if normalized:
+        return normalized
+
+    # Fallback: try Nielsen to UI mapping
+    ui_name = NIELSEN_TO_UI_CHANNEL_MAP.get(channel_upper)
+    if ui_name:
+        return ui_name
+
+    # Return original with title case as last resort
+    return channel.strip().title()
+
+
+def _normalized_user_channel_set(user_channels: List[str]) -> set:
+    """Normalize user-selected channel names to canonical UI names for comparison."""
+    return {_normalize_channel_name(ch) for ch in (user_channels or [])}
+
+
+def _check_allocation_validity(
+    parsed_allocation: dict,
+    user_channels: set,
+    external_run_id: int,
+) -> tuple:
+    """
+    Check if LLM allocation output is valid.
+
+    Validates:
+    1. All user-selected channels are present
+    2. No extra channels that user didn't select
+    3. Percentages sum to 100% (within 1% tolerance)
+    4. kpi_projection is present and not null
+    5. confidence_score is present and not null
+
+    Returns:
+        Tuple of (is_valid: bool, errors: List[str])
+    """
+    errors = []
+    allocations = parsed_allocation.get("allocations", parsed_allocation.get("channels", []))
+
+    # Normalize user channels to canonical UI names using the same normalization
+    normalized_user_channels = set()
+    for ch in user_channels:
+        normalized_user_channels.add(_normalize_channel_name(ch))
+
+    # Get output channels (normalized to UI names)
+    output_channels = set()
+    for alloc in allocations:
+        channel = alloc.get("channel", alloc.get("name", ""))
+        normalized = _normalize_channel_name(channel)
+        output_channels.add(normalized)
+
+    # Check for missing channels
+    missing = normalized_user_channels - output_channels
+    if missing:
+        errors.append(f"Missing channels: {', '.join(sorted(missing))}")
+
+    # Check for extra channels (only if user specified channels)
+    if user_channels:
+        extra = output_channels - normalized_user_channels
+        if extra:
+            errors.append(f"Extra channels not requested: {', '.join(sorted(extra))}")
+
+    # Check sum (within 1% tolerance)
+    total = sum(
+        float(alloc.get("share_pct", alloc.get("percentage", 0)) or 0)
+        for alloc in allocations
+    )
+    if abs(total - 100.0) > 1.0:
+        errors.append(f"Allocation sum is {total:.1f}% (expected 100%)")
+
+    # Check kpi_projection (must be present and not null)
+    kpi_proj = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
+    if kpi_proj is None:
+        errors.append("kpi_projection is missing or null")
+
+    # Check confidence (must be present and not null)
+    confidence = parsed_allocation.get("confidence", parsed_allocation.get("confidence_score"))
+    if confidence is None:
+        errors.append("confidence_score is missing or null")
+
+    is_valid = len(errors) == 0
+    if not is_valid:
+        logger.warning(f"[ExternalRunId {external_run_id}] Allocation validation failed: {errors}")
+
+    return is_valid, errors
+
+
+async def _retry_llm_allocation(
+    llm_client,
+    assembled_prompt,
+    external_run_id: int,
+) -> tuple:
+    """
+    Retry LLM call for allocation.
+
+    Returns:
+        Tuple of (parsed_allocation: dict or None, success: bool)
+    """
+    logger.info(f"[ExternalRunId {external_run_id}] Retrying LLM allocation call...")
+
+    try:
+        llm_response = await llm_client.generate(
+            system_prompt=assembled_prompt.system_prompt,
+            user_prompt=assembled_prompt.user_prompt,
+            temperature=0.3,  # Lower temperature for retry
+            max_tokens=4096,
+            json_mode=True,
+        )
+
+        logger.info(f"[ExternalRunId {external_run_id}] Retry LLM response: {llm_response.total_tokens} tokens")
+
+        parsed_allocation = json.loads(llm_response.content)
+        return parsed_allocation, True
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[ExternalRunId {external_run_id}] Retry failed - JSON parse error: {e}")
+        return None, False
+    except Exception as e:
+        logger.error(f"[ExternalRunId {external_run_id}] Retry failed - error: {e}")
+        return None, False
+
+
+async def _resolve_customer_historical_spend(
+    session: AsyncSession,
+    brand_info: Optional[dict],
+    external_run_id: int,
+) -> tuple[Optional[float], Optional[dict]]:
+    """Resolve customer historical spend: snapshot -> DB recompute -> warning.
+
+    Returns:
+        Tuple of (spend_eur or None, warning dict or None)
+    """
+    brand_info = brand_info or {}
+
+    spend = brand_info.get("total_spend_teuro")
+    if spend:
+        logger.info(
+            f"[ExternalRunId {external_run_id}] Using historical spend from snapshot: {spend}"
+        )
+        return float(spend), None
+
+    nielsen_brand = brand_info.get("nielsen_brand")
+    if nielsen_brand:
+        from src.services.stage1.repository import Stage1Repository
+
+        repo = Stage1Repository(session)
+        spend = await repo.get_nielsen_brand_total_spend(marke=nielsen_brand)
+        if spend:
+            logger.info(
+                f"[ExternalRunId {external_run_id}] Recomputed historical spend from DB "
+                f"via Stage1Repository.get_nielsen_brand_total_spend(marke={nielsen_brand!r}): "
+                f"{spend}"
+            )
+            return spend, None
+
+        logger.warning(
+            f"[ExternalRunId {external_run_id}] DB recompute returned no spend for "
+            f"nielsen_brand={nielsen_brand!r}"
+        )
+
+    logger.warning(f"[ExternalRunId {external_run_id}] Historical spend not available")
+    return None, {
+        "color": "yellow",
+        "title": "Historical Spend Unavailable",
+        "description": (
+            "Customer's historical spend data not available. "
+            "Budget recommendations may be less anchored to customer's typical scale."
+        ),
+    }
+
+
+async def _validate_allocation_with_retry(
+    llm_client,
+    assembled_prompt,
+    parsed_allocation: dict,
+    normalized_user_channels_set: set,
+    external_run_id: int,
+    debug_dir: Optional[str] = None,
+) -> tuple[dict, list, bool]:
+    """Validate LLM allocation output; retry once on failure with paired warnings.
+
+    Emits two distinct warnings when retry is attempted:
+    1. At retry trigger — validation failed, regeneration starting
+    2. After retry — success, still invalid, or retry call failed
+
+    Returns:
+        Tuple of (parsed_allocation, validation_warnings, did_retry)
+    """
+    validation_warnings: list = []
+    did_retry = False
+
+    is_valid, validation_errors = _check_allocation_validity(
+        parsed_allocation, normalized_user_channels_set, external_run_id
+    )
+    if is_valid:
+        return parsed_allocation, validation_warnings, did_retry
+
+    validation_warnings.append({
+        "color": "yellow",
+        "title": "Allocation Validation Failed",
+        "description": (
+            f"AI output did not pass validation ({'; '.join(validation_errors)}). "
+            "Regenerating allocation."
+        ),
+    })
+
+    logger.warning(
+        f"[ExternalRunId {external_run_id}] Allocation invalid, attempting retry..."
+    )
+    retry_result, retry_success = await _retry_llm_allocation(
+        llm_client, assembled_prompt, external_run_id
+    )
+
+    if retry_success and retry_result:
+        did_retry = True
+        parsed_allocation = retry_result
+
+        if debug_dir:
+            with open(
+                f"{debug_dir}/07_parsed_response_retry.json", "w", encoding="utf-8"
+            ) as f:
+                json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
+        is_valid_after_retry, validation_errors_after_retry = _check_allocation_validity(
+            parsed_allocation, normalized_user_channels_set, external_run_id
+        )
+
+        if is_valid_after_retry:
+            validation_warnings.append({
+                "color": "yellow",
+                "title": "Allocation Regenerated",
+                "description": (
+                    "AI allocation was successfully regenerated after validation failed."
+                ),
+            })
+        else:
+            validation_warnings.append({
+                "color": "yellow",
+                "title": "Allocation Still Invalid After Retry",
+                "description": (
+                    "Regenerated allocation still has validation issues. "
+                    "Using best available output with adjustments."
+                ),
+            })
+            for error in validation_errors_after_retry:
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "Allocation Issue",
+                    "description": error,
+                })
+    else:
+        validation_warnings.append({
+            "color": "yellow",
+            "title": "Allocation Retry Failed",
+            "description": (
+                "AI allocation regeneration failed. Using original output with adjustments."
+            ),
+        })
+        for error in validation_errors:
+            validation_warnings.append({
+                "color": "yellow",
+                "title": "Allocation Issue",
+                "description": error,
+            })
+
+    return parsed_allocation, validation_warnings, did_retry
+
+
+def _check_guardrail_violations(
+    allocations: list,
+    external_run_id: int,
+) -> list:
+    """
+    Check allocations against guardrail guidelines.
+    Returns warnings for violations but does NOT modify values.
+
+    Guidelines:
+    - Minimum 5% per channel
+    - Maximum 60% single channel
+    - At least 3 channels allocated
+    """
+    warnings = []
+
+    # Guideline: Minimum 5% per channel
+    for alloc in allocations:
+        share = alloc.get("share_pct", 0)
+        channel = alloc.get("channel", "Unknown")
+        if 0 < share < 5.0:
+            logger.info(f"[ExternalRunId {external_run_id}] Guardrail: {channel} at {share}% (below 5% guideline)")
+            warnings.append({
+                "color": "yellow",
+                "title": "Low Allocation",
+                "description": f"{channel} allocated {share:.1f}% (below 5% guideline). Value shown as-is per AI recommendation.",
+            })
+
+    # Guideline: Maximum 60% single channel
+    for alloc in allocations:
+        share = alloc.get("share_pct", 0)
+        channel = alloc.get("channel", "Unknown")
+        if share > 60.0:
+            logger.info(f"[ExternalRunId {external_run_id}] Guardrail: {channel} at {share}% (above 60% guideline)")
+            warnings.append({
+                "color": "yellow",
+                "title": "High Concentration",
+                "description": f"{channel} allocated {share:.1f}% (above 60% guideline). Value shown as-is per AI recommendation.",
+            })
+
+    # Guideline: At least 3 channels
+    if len(allocations) < 3:
+        logger.info(f"[ExternalRunId {external_run_id}] Guardrail: Only {len(allocations)} channels (guideline suggests 3+)")
+        warnings.append({
+            "color": "yellow",
+            "title": "Limited Diversification",
+            "description": f"Only {len(allocations)} channel(s) allocated (guideline suggests 3+). Allocation shown as-is per AI recommendation.",
+        })
+
+    return warnings
 
 
 async def get_ai_run_by_external_id(db: AsyncSession, external_run_id: int) -> Optional[PrismaProjectVersionAiRun]:
@@ -381,10 +810,12 @@ async def run_full_pipeline_background(
             )
 
             stage1_result = await orchestrator.process(user_input, run_id=str(external_run_id))
+            stage1_ai_calls = stage1_result.ai_calls_count
 
             if stage1_result.status == Stage1Status.FAILED:
                 raw_error = "; ".join(stage1_result.errors) if stage1_result.errors else "Stage 1 failed"
                 error_msg = humanize_error(raw_error)
+                _persist_trace_snapshot(ai_run, stage1_ai_calls, 0, False)
                 await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
                 await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 logger.error(f"[ExternalRunId {external_run_id}] Stage 1 failed: {raw_error}")
@@ -403,6 +834,7 @@ async def run_full_pipeline_background(
             if not snapshot_competitors:
                 error_msg = "No competitors found for the given brand and industry. Please check your inputs."
                 logger.error(f"[ExternalRunId {external_run_id}] {error_msg}")
+                _persist_trace_snapshot(ai_run, stage1_ai_calls, 0, False)
                 await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
                 await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
@@ -436,6 +868,8 @@ async def run_full_pipeline_background(
             # =================================================================
             await _update_ai_run_status(session, ai_run, "generating", stage="S2", progress_pct=40)
 
+            debug_dir = _ensure_artifact_debug_dir(external_run_id)
+
             llm_client = OpenAIClient()
             prompt_service = PromptAssemblyService(session)
 
@@ -445,8 +879,33 @@ async def run_full_pipeline_background(
             # Get customer's historical spend from Stage 1 data
             # NOTE: Despite the name 'total_spend_teuro', it's already converted to EUR in repository.py
             customer_historical_spend = None
+            historical_spend_warning = None
             if stage1_result.brand_data and stage1_result.brand_data.total_spend_teuro:
                 customer_historical_spend = stage1_result.brand_data.total_spend_teuro  # Already in EUR
+            elif stage1_result.confirmed_brand and stage1_result.confirmed_brand.nielsen_brand:
+                from src.services.stage1.repository import Stage1Repository
+
+                repo = Stage1Repository(session)
+                customer_historical_spend = await repo.get_nielsen_brand_total_spend(
+                    marke=stage1_result.confirmed_brand.nielsen_brand
+                )
+                if customer_historical_spend:
+                    logger.info(
+                        f"[ExternalRunId {external_run_id}] Recomputed historical spend from DB "
+                        f"via Stage1Repository.get_nielsen_brand_total_spend("
+                        f"marke={stage1_result.confirmed_brand.nielsen_brand!r}): "
+                        f"{customer_historical_spend}"
+                    )
+
+            if customer_historical_spend is None:
+                logger.warning(
+                    f"[ExternalRunId {external_run_id}] Historical spend not available from Stage 1"
+                )
+                historical_spend_warning = {
+                    "color": "yellow",
+                    "title": "Historical Spend Unavailable",
+                    "description": "Customer's historical spend data not available. Budget recommendations may be less anchored to customer's typical scale.",
+                }
 
             # Inform Stage 2 prompt if the user changed media channels for this run
             additional_context = inputs.goal_text
@@ -477,17 +936,14 @@ async def run_full_pipeline_background(
                 wirtschaftsgruppe=inputs.industry,
             )
 
-            # DEBUG: Save prompt to file for debugging
-            if get_settings().stage1_debug_mode:
-                debug_dir = f"debug_output/run_{external_run_id}"
-                os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/06_prompt.txt", "w", encoding="utf-8") as f:
-                    f.write("=== SYSTEM PROMPT ===\n")
-                    f.write(assembled_prompt.system_prompt)
-                    f.write("\n\n=== USER PROMPT ===\n")
-                    f.write(assembled_prompt.user_prompt)
-                    f.write("\n\n=== METADATA ===\n")
-                    f.write(json.dumps(assembled_prompt.metadata, indent=2, default=str))
+            # Save Stage 2 prompt artifact
+            with open(f"{debug_dir}/06_prompt.txt", "w", encoding="utf-8") as f:
+                f.write("=== SYSTEM PROMPT ===\n")
+                f.write(assembled_prompt.system_prompt)
+                f.write("\n\n=== USER PROMPT ===\n")
+                f.write(assembled_prompt.user_prompt)
+                f.write("\n\n=== METADATA ===\n")
+                f.write(json.dumps(assembled_prompt.metadata, indent=2, default=str))
 
             logger.info(f"[ExternalRunId {external_run_id}] Calling OpenAI...")
 
@@ -501,18 +957,14 @@ async def run_full_pipeline_background(
 
             logger.info(f"[ExternalRunId {external_run_id}] OpenAI response: {llm_response.total_tokens} tokens")
 
-            # DEBUG: Save raw LLM response
-            if get_settings().stage1_debug_mode:
-                debug_dir = f"debug_output/run_{external_run_id}"
-                os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/06_llm_response.txt", "w", encoding="utf-8") as f:
-                    f.write("=== RAW LLM RESPONSE ===\n")
-                    f.write(f"Model: {llm_response.model}\n")
-                    f.write(f"Total Tokens: {llm_response.total_tokens}\n")
-                    f.write(f"Prompt Tokens: {llm_response.prompt_tokens}\n")
-                    f.write(f"Completion Tokens: {llm_response.completion_tokens}\n")
-                    f.write("\n=== CONTENT ===\n")
-                    f.write(llm_response.content)
+            with open(f"{debug_dir}/06_llm_response.txt", "w", encoding="utf-8") as f:
+                f.write("=== RAW LLM RESPONSE ===\n")
+                f.write(f"Model: {llm_response.model}\n")
+                f.write(f"Total Tokens: {llm_response.total_tokens}\n")
+                f.write(f"Prompt Tokens: {llm_response.prompt_tokens}\n")
+                f.write(f"Completion Tokens: {llm_response.completion_tokens}\n")
+                f.write("\n=== CONTENT ===\n")
+                f.write(llm_response.content)
 
             # =================================================================
             # Stage 3: Parse Response
@@ -525,21 +977,36 @@ async def run_full_pipeline_background(
             except json.JSONDecodeError as e:
                 logger.error(f"[ExternalRunId {external_run_id}] Failed to parse LLM response: {e}")
                 error_msg = "Could not process AI response. Please try running again."
+                _persist_trace_snapshot(ai_run, stage1_ai_calls, 1, False)
                 await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
                 await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
-            # DEBUG: Save parsed allocation (raw from LLM before post-processing)
-            if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
-                    json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+            with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
+                json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
+            # Get user-selected channels for validation
+            user_channels = inputs.media_channels or []
+            normalized_user_channels_set = _normalized_user_channel_set(user_channels)
+
+            # =================================================================
+            # Validation & Retry Logic
+            # =================================================================
+            parsed_allocation, validation_warnings, did_retry = await _validate_allocation_with_retry(
+                llm_client,
+                assembled_prompt,
+                parsed_allocation,
+                normalized_user_channels_set,
+                external_run_id,
+                debug_dir=debug_dir,
+            )
+            stage2_ai_calls = 2 if did_retry else 1
 
             # Build allocation result
             allocations = []
             channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
 
-            # Get user-selected channels and map to allowed Nielsen channel names
-            user_channels = inputs.media_channels or []
+            # Map to allowed Nielsen channel names
             allowed_nielsen_channels = get_allowed_nielsen_channels(user_channels)
             logger.info(f"[ExternalRunId {external_run_id}] User channels: {user_channels} -> Allowed Nielsen: {allowed_nielsen_channels}")
 
@@ -555,13 +1022,13 @@ async def run_full_pipeline_background(
                 # Get Nielsen channel name from LLM response
                 nielsen_channel = channel.get("name", channel.get("channel", "Unknown"))
 
-                # Filter: Only include channels the user selected
-                if allowed_nielsen_channels and nielsen_channel.upper() not in allowed_nielsen_channels:
-                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} - not in user selection")
-                    continue
+                # Normalize channel name to UI name FIRST (handles all German/English variants)
+                ui_channel = _normalize_channel_name(nielsen_channel)
 
-                # Map Nielsen channel name to user-facing UI name
-                ui_channel = map_nielsen_channel_to_ui(nielsen_channel)
+                # Filter: Only include channels the user selected (compare normalized UI names)
+                if normalized_user_channels_set and ui_channel not in normalized_user_channels_set:
+                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} -> {ui_channel} - not in user selection {normalized_user_channels_set}")
+                    continue
 
                 # Get share percentage - handle various field names
                 share_pct = float(
@@ -617,23 +1084,10 @@ async def run_full_pipeline_background(
             allocations = list(channel_map.values())
             logger.info(f"[ExternalRunId {external_run_id}] After deduplication: {len(allocations)} unique channels")
 
-            # Step 2: Normalize user_channels to canonical UI names for comparison
-            # This handles cases where user selected "Online" which maps to "Digital"
-            normalized_user_channels = set()
-            for ch in user_channels:
-                # Check if user channel is a Nielsen name that should be mapped
-                nielsen_upper = ch.upper()
-                if nielsen_upper in NIELSEN_TO_UI_CHANNEL_MAP:
-                    # User used Nielsen name, map to UI name
-                    normalized_user_channels.add(NIELSEN_TO_UI_CHANNEL_MAP[nielsen_upper])
-                elif ch in UI_TO_NIELSEN_CHANNEL_MAP:
-                    # User used UI name, keep as-is
-                    normalized_user_channels.add(ch)
-                else:
-                    # Unknown channel, keep original
-                    normalized_user_channels.add(ch)
+            # Step 2: Compare against normalized user channel set (same as validation)
+            normalized_user_channels = normalized_user_channels_set
 
-            logger.info(f"[ExternalRunId {external_run_id}] User channels normalized: {user_channels} -> {normalized_user_channels}")
+            logger.info(f"[ExternalRunId {external_run_id}] User channels (normalized): {normalized_user_channels}")
 
             # Step 3: Normalize shares to 100% if needed
             total_share = sum(a["share_pct"] for a in allocations)
@@ -647,32 +1101,24 @@ async def run_full_pipeline_background(
                         a["budget_gross_eur"] = round(total_budget * a["share_pct"] / 100, 2)
 
             # Step 4: Check for missing user-selected channels (using normalized names)
+            # NOTE: Do NOT fabricate allocations for missing channels.
+            # Instead, add warnings explaining why they were excluded.
             allocated_channels = {a["channel"] for a in allocations}
             missing_channels = normalized_user_channels - allocated_channels
 
             if missing_channels:
-                logger.warning(f"[ExternalRunId {external_run_id}] Missing user-selected channels: {missing_channels}")
-                # Add missing channels with minimal allocation (5% each, taken proportionally from existing)
+                logger.warning(f"[ExternalRunId {external_run_id}] Channels excluded (no AI allocation): {missing_channels}")
                 for missing_ch in missing_channels:
-                    min_allocation = 5.0
-                    # Reduce existing allocations proportionally to make room
-                    reduction_factor = (100.0 - min_allocation) / 100.0 if allocations else 1.0
-                    for a in allocations:
-                        a["share_pct"] = round(a["share_pct"] * reduction_factor, 2)
-
-                    # Calculate budget for missing channel
-                    missing_budget = round(total_budget * min_allocation / 100, 2) if total_budget else None
-
-                    allocations.append({
-                        "channel": missing_ch,
-                        "share_pct": min_allocation,
-                        "budget_gross_eur": missing_budget,
-                        "reasoning": f"No competitor benchmark data available for {missing_ch}. Allocated minimum 5% as part of user's selected channel mix.",
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Channel Excluded",
+                        "description": f"{missing_ch} was not allocated by AI — insufficient benchmark data for this channel.",
                     })
 
-                # Re-normalize to ensure exactly 100%
+                # Re-normalize remaining allocations to 100% (don't add missing channels)
                 total_share = sum(a["share_pct"] for a in allocations)
                 if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                    logger.info(f"[ExternalRunId {external_run_id}] Normalizing {total_share}% to 100% after excluding missing channels")
                     scale_factor = 100.0 / total_share
                     for a in allocations:
                         a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
@@ -715,11 +1161,46 @@ async def run_full_pipeline_background(
                 except (TypeError, ValueError):
                     logger.warning(f"[ExternalRunId {external_run_id}] Could not parse kpi_projection: {kpi_projection_raw}")
                     kpi_projection = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "KPI Projection Invalid",
+                        "description": "AI returned invalid KPI projection value. Defaulting to 0.",
+                    })
 
-            # If LLM didn't return kpi_projection, estimate based on mode
+            # If LLM didn't return kpi_projection after retry, default to 0 with warning
             if kpi_projection is None:
                 logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return kpi_projection, defaulting to 0.0")
                 kpi_projection = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "KPI Projection Unavailable",
+                    "description": "AI could not estimate KPI impact. Defaulting to 0 (no projected change).",
+                })
+
+            # Extract confidence_score from LLM response
+            confidence_raw = parsed_allocation.get("confidence", parsed_allocation.get("confidence_score"))
+            confidence_score = None
+            if confidence_raw is not None:
+                try:
+                    confidence_score = float(confidence_raw)
+                except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse confidence: {confidence_raw}")
+                    confidence_score = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Confidence Score Invalid",
+                        "description": "AI returned invalid confidence value. Defaulting to 0.",
+                    })
+
+            # If LLM didn't return confidence after retry, default to 0 with warning
+            if confidence_score is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return confidence, defaulting to 0.0")
+                confidence_score = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "Confidence Score Unavailable",
+                    "description": "AI could not assess confidence level. Defaulting to 0 (low confidence).",
+                })
 
             # Build structured warnings from context
             # Identify competitors excluded due to missing Nielsen data
@@ -736,39 +1217,34 @@ async def run_full_pipeline_background(
                 excluded_competitors=excluded_competitors,
             )
 
+            # Add validation warnings (from retry logic, missing channels, etc.)
+            structured_warnings.extend(validation_warnings)
+
+            # Add historical spend warning if applicable
+            if historical_spend_warning:
+                structured_warnings.append(historical_spend_warning)
+
+            # Check guardrail violations (warnings only, values not modified)
+            guardrail_warnings = _check_guardrail_violations(allocations, external_run_id)
+            structured_warnings.extend(guardrail_warnings)
+
             allocation_result = {
                 "run_id": external_run_id,
                 "allocations": allocations,
                 "total_budget_eur": total_budget,
                 "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
-                "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
+                "confidence_score": confidence_score,  # Use extracted/defaulted value, not raw
                 "warnings": structured_warnings,
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
             }
 
-            # DEBUG: Save final result (after post-processing)
-            if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/08_final_result.json", "w", encoding="utf-8") as f:
-                    json.dump(allocation_result, f, indent=2, ensure_ascii=False)
-                logger.info(f"[ExternalRunId {external_run_id}] Debug files saved to {debug_dir}/")
-
-                # Create ZIP archive of debug files
-                zip_path = f"debug_output/run_{external_run_id}.zip"
-                try:
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                        for root, dirs, files in os.walk(debug_dir):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                arcname = os.path.relpath(file_path, debug_dir)
-                                zipf.write(file_path, arcname)
-                    # Delete the folder after successful ZIP creation
-                    shutil.rmtree(debug_dir)
-                    logger.info(f"[ExternalRunId {external_run_id}] Debug ZIP created: {zip_path}")
-                except Exception as zip_error:
-                    logger.warning(f"[ExternalRunId {external_run_id}] Failed to create debug ZIP: {zip_error}")
+            with open(f"{debug_dir}/08_final_result.json", "w", encoding="utf-8") as f:
+                json.dump(allocation_result, f, indent=2, ensure_ascii=False)
+            logger.info(f"[ExternalRunId {external_run_id}] Artifact files saved to {debug_dir}/")
+            _create_artifact_zip(external_run_id, debug_dir)
 
             # Store in ProjectVersionAiRun
             ai_run.allocationResult = allocation_result
@@ -777,6 +1253,7 @@ async def run_full_pipeline_background(
             ai_run.updatedAt = datetime.utcnow()
             ai_run.progressPct = 100
             ai_run.stage = None
+            _persist_trace_snapshot(ai_run, stage1_ai_calls, stage2_ai_calls, did_retry)
             flag_modified(ai_run, 'allocationResult')  # JSONB column needs explicit flag
 
             await session.commit()
@@ -1055,6 +1532,61 @@ async def _update_ai_run_status(
     await session.commit()
 
 
+def _artifact_run_dir(run_id: int) -> str:
+    return f"debug_output/run_{run_id}"
+
+
+def _artifact_zip_path(run_id: int) -> str:
+    return f"debug_output/run_{run_id}.zip"
+
+
+def _ensure_artifact_debug_dir(external_run_id: int) -> str:
+    debug_dir = _artifact_run_dir(external_run_id)
+    os.makedirs(debug_dir, exist_ok=True)
+    return debug_dir
+
+
+def _create_artifact_zip(external_run_id: int, debug_dir: str) -> None:
+    """Zip artifact files and remove the run directory after successful archive."""
+    zip_path = _artifact_zip_path(external_run_id)
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(debug_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, debug_dir)
+                    zipf.write(file_path, arcname)
+        shutil.rmtree(debug_dir)
+        logger.info(f"[ExternalRunId {external_run_id}] Artifact ZIP created: {zip_path}")
+    except Exception as zip_error:
+        logger.warning(f"[ExternalRunId {external_run_id}] Failed to create artifact ZIP: {zip_error}")
+
+
+def _build_trace_snapshot(
+    stage1_ai_calls: int,
+    stage2_ai_calls: int,
+    did_retry: bool,
+) -> dict:
+    return {
+        "llm_calls_count": stage1_ai_calls + stage2_ai_calls,
+        "stage1_ai_calls": stage1_ai_calls,
+        "stage2_ai_calls": stage2_ai_calls,
+        "stage2_retry": did_retry,
+    }
+
+
+def _persist_trace_snapshot(
+    ai_run: PrismaProjectVersionAiRun,
+    stage1_ai_calls: int,
+    stage2_ai_calls: int,
+    did_retry: bool,
+) -> None:
+    ai_run.traceSnapshot = _build_trace_snapshot(
+        stage1_ai_calls, stage2_ai_calls, did_retry
+    )
+    flag_modified(ai_run, "traceSnapshot")
+
+
 def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
     """Build the competitor snapshot JSON for ProjectVersionAiRun.competitorSnapshot."""
     competitors = []
@@ -1077,6 +1609,8 @@ def _build_competitor_snapshot(result: Stage1Result, industry: str) -> dict:
             "nielsen_brand": result.confirmed_brand.nielsen_brand if result.confirmed_brand else None,
             "match_type": result.confirmed_brand.match_type.value if result.confirmed_brand else None,
             "confidence": result.confirmed_brand.confidence if result.confirmed_brand else None,
+            # Historical spend from brand data (already in EUR despite the name)
+            "total_spend_teuro": result.brand_data.total_spend_teuro if result.brand_data else None,
         } if result.confirmed_brand else None,
         "yougov_sectors": result.yougov_sectors,
         "nielsen_sectors": result.nielsen_sectors,
@@ -1154,13 +1688,19 @@ async def _run_stages_2_to_4_pipeline(
 
             logger.info(f"[ExternalRunId {external_run_id}] Confirmed: YouGov={yougov_brands}, Nielsen={nielsen_brands}")
 
-            # Customer historical spend - not available in Stage 2-4 standalone pipeline
-            customer_historical_spend = None
+            # Extract customer historical spend from competitorSnapshot (set during Stage 1)
+            brand_info = (ai_run.competitorSnapshot or {}).get("brand_info")
+            customer_historical_spend, historical_spend_warning = await _resolve_customer_historical_spend(
+                session, brand_info, external_run_id
+            )
 
             # =================================================================
             # Stage 2: AI Allocation Generation
             # =================================================================
             await _update_ai_run_status(session, ai_run, "generating", stage="S2", progress_pct=40)
+
+            debug_dir = _ensure_artifact_debug_dir(external_run_id)
+            stage1_ai_calls = 0
 
             llm_client = OpenAIClient()
             prompt_service = PromptAssemblyService(session)
@@ -1214,17 +1754,14 @@ async def _run_stages_2_to_4_pipeline(
                 wirtschaftsgruppe=inputs.industry,
             )
 
-            # DEBUG: Save prompt to file for debugging
-            if get_settings().stage1_debug_mode:
-                debug_dir = f"debug_output/run_{external_run_id}"
-                os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/06_prompt.txt", "w", encoding="utf-8") as f:
-                    f.write("=== SYSTEM PROMPT ===\n")
-                    f.write(assembled_prompt.system_prompt)
-                    f.write("\n\n=== USER PROMPT ===\n")
-                    f.write(assembled_prompt.user_prompt)
-                    f.write("\n\n=== METADATA ===\n")
-                    f.write(json.dumps(assembled_prompt.metadata, indent=2, default=str))
+            # Save Stage 2 prompt artifact
+            with open(f"{debug_dir}/06_prompt.txt", "w", encoding="utf-8") as f:
+                f.write("=== SYSTEM PROMPT ===\n")
+                f.write(assembled_prompt.system_prompt)
+                f.write("\n\n=== USER PROMPT ===\n")
+                f.write(assembled_prompt.user_prompt)
+                f.write("\n\n=== METADATA ===\n")
+                f.write(json.dumps(assembled_prompt.metadata, indent=2, default=str))
 
             logger.info(f"[ExternalRunId {external_run_id}] Calling OpenAI...")
 
@@ -1238,18 +1775,14 @@ async def _run_stages_2_to_4_pipeline(
 
             logger.info(f"[ExternalRunId {external_run_id}] OpenAI response: {llm_response.total_tokens} tokens")
 
-            # DEBUG: Save raw LLM response
-            if get_settings().stage1_debug_mode:
-                debug_dir = f"debug_output/run_{external_run_id}"
-                os.makedirs(debug_dir, exist_ok=True)
-                with open(f"{debug_dir}/06_llm_response.txt", "w", encoding="utf-8") as f:
-                    f.write("=== RAW LLM RESPONSE ===\n")
-                    f.write(f"Model: {llm_response.model}\n")
-                    f.write(f"Total Tokens: {llm_response.total_tokens}\n")
-                    f.write(f"Prompt Tokens: {llm_response.prompt_tokens}\n")
-                    f.write(f"Completion Tokens: {llm_response.completion_tokens}\n")
-                    f.write("\n=== CONTENT ===\n")
-                    f.write(llm_response.content)
+            with open(f"{debug_dir}/06_llm_response.txt", "w", encoding="utf-8") as f:
+                f.write("=== RAW LLM RESPONSE ===\n")
+                f.write(f"Model: {llm_response.model}\n")
+                f.write(f"Total Tokens: {llm_response.total_tokens}\n")
+                f.write(f"Prompt Tokens: {llm_response.prompt_tokens}\n")
+                f.write(f"Completion Tokens: {llm_response.completion_tokens}\n")
+                f.write("\n=== CONTENT ===\n")
+                f.write(llm_response.content)
 
             # =================================================================
             # Stage 3: Parse Response
@@ -1261,20 +1794,35 @@ async def _run_stages_2_to_4_pipeline(
             except json.JSONDecodeError as e:
                 logger.error(f"[ExternalRunId {external_run_id}] Failed to parse LLM response: {e}")
                 error_msg = "Could not process AI response. Please try running again."
+                _persist_trace_snapshot(ai_run, stage1_ai_calls, 1, False)
                 await _update_ai_run_status(session, ai_run, "failed", error=error_msg)
                 await _insert_error_card(prisma_ai_run_id, external_run_id, error_msg)
                 return
 
-            # DEBUG: Save parsed allocation
-            if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
-                    json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+            with open(f"{debug_dir}/07_parsed_response.json", "w", encoding="utf-8") as f:
+                json.dump(parsed_allocation, f, indent=2, ensure_ascii=False)
+
+            # Get user-selected channels for validation
+            user_channels = inputs.media_channels or []
+            normalized_user_channels_set = _normalized_user_channel_set(user_channels)
+
+            # =================================================================
+            # Validation & Retry Logic
+            # =================================================================
+            parsed_allocation, validation_warnings, did_retry = await _validate_allocation_with_retry(
+                llm_client,
+                assembled_prompt,
+                parsed_allocation,
+                normalized_user_channels_set,
+                external_run_id,
+                debug_dir=debug_dir,
+            )
+            stage2_ai_calls = 2 if did_retry else 1
 
             # Build allocation result (same logic as main pipeline)
             allocations = []
             channels_data = parsed_allocation.get("channels", parsed_allocation.get("allocations", []))
 
-            user_channels = inputs.media_channels or []
             allowed_nielsen_channels = get_allowed_nielsen_channels(user_channels)
 
             total_budget_val = inputs.total_budget
@@ -1286,10 +1834,13 @@ async def _run_stages_2_to_4_pipeline(
             for channel in channels_data:
                 nielsen_channel = channel.get("name", channel.get("channel", "Unknown"))
 
-                if allowed_nielsen_channels and nielsen_channel.upper() not in allowed_nielsen_channels:
-                    continue
+                # Normalize channel name to UI name FIRST (handles all German/English variants)
+                ui_channel = _normalize_channel_name(nielsen_channel)
 
-                ui_channel = map_nielsen_channel_to_ui(nielsen_channel)
+                # Filter: Only include channels the user selected (compare normalized UI names)
+                if normalized_user_channels_set and ui_channel not in normalized_user_channels_set:
+                    logger.debug(f"[ExternalRunId {external_run_id}] Skipping channel {nielsen_channel} -> {ui_channel} - not in user selection {normalized_user_channels_set}")
+                    continue
 
                 share_pct = float(
                     channel.get("percentage") or
@@ -1334,16 +1885,8 @@ async def _run_stages_2_to_4_pipeline(
 
             allocations = list(channel_map.values())
 
-            # Normalize user channels
-            normalized_user_channels = set()
-            for ch in user_channels:
-                nielsen_upper = ch.upper()
-                if nielsen_upper in NIELSEN_TO_UI_CHANNEL_MAP:
-                    normalized_user_channels.add(NIELSEN_TO_UI_CHANNEL_MAP[nielsen_upper])
-                elif ch in UI_TO_NIELSEN_CHANNEL_MAP:
-                    normalized_user_channels.add(ch)
-                else:
-                    normalized_user_channels.add(ch)
+            # Compare against normalized user channel set (same as validation)
+            normalized_user_channels = normalized_user_channels_set
 
             # Normalize shares to 100%
             total_share = sum(a["share_pct"] for a in allocations)
@@ -1354,29 +1897,24 @@ async def _run_stages_2_to_4_pipeline(
                     if total_budget_val and a["share_pct"] > 0:
                         a["budget_gross_eur"] = round(total_budget_val * a["share_pct"] / 100, 2)
 
-            # Add missing channels
+            # Check for missing channels - do NOT fabricate allocations
+            # Instead, add warnings explaining why they were excluded
             allocated_channels = {a["channel"] for a in allocations}
             missing_channels = normalized_user_channels - allocated_channels
 
             if missing_channels:
+                logger.warning(f"[ExternalRunId {external_run_id}] Channels excluded (no AI allocation): {missing_channels}")
                 for missing_ch in missing_channels:
-                    min_allocation = 5.0
-                    reduction_factor = (100.0 - min_allocation) / 100.0 if allocations else 1.0
-                    for a in allocations:
-                        a["share_pct"] = round(a["share_pct"] * reduction_factor, 2)
-
-                    missing_budget = round(total_budget_val * min_allocation / 100, 2) if total_budget_val else None
-
-                    allocations.append({
-                        "channel": missing_ch,
-                        "share_pct": min_allocation,
-                        "budget_gross_eur": missing_budget,
-                        "reasoning": f"No competitor benchmark data available for {missing_ch}. Allocated minimum 5%.",
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Channel Excluded",
+                        "description": f"{missing_ch} was not allocated by AI — insufficient benchmark data for this channel.",
                     })
 
-                # Re-normalize
+                # Re-normalize remaining allocations to 100% (don't add missing channels)
                 total_share = sum(a["share_pct"] for a in allocations)
                 if total_share > 0 and abs(total_share - 100.0) > 0.01:
+                    logger.info(f"[ExternalRunId {external_run_id}] Normalizing {total_share}% to 100% after excluding missing channels")
                     scale_factor = 100.0 / total_share
                     for a in allocations:
                         a["share_pct"] = round(a["share_pct"] * scale_factor, 2)
@@ -1415,16 +1953,55 @@ async def _run_stages_2_to_4_pipeline(
                     largest = max(allocations, key=lambda a: a["budget_gross_eur"])
                     largest["budget_gross_eur"] = round(largest["budget_gross_eur"] + residue, 2)
 
+            # Extract kpi_projection from LLM response
             kpi_projection_raw = parsed_allocation.get("kpi_projection", parsed_allocation.get("kpiProjection"))
             kpi_projection = None
             if kpi_projection_raw is not None:
                 try:
                     kpi_projection = float(kpi_projection_raw)
                 except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse kpi_projection: {kpi_projection_raw}")
                     kpi_projection = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "KPI Projection Invalid",
+                        "description": "AI returned invalid KPI projection value. Defaulting to 0.",
+                    })
 
+            # If LLM didn't return kpi_projection after retry, default to 0 with warning
             if kpi_projection is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return kpi_projection, defaulting to 0.0")
                 kpi_projection = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "KPI Projection Unavailable",
+                    "description": "AI could not estimate KPI impact. Defaulting to 0 (no projected change).",
+                })
+
+            # Extract confidence_score from LLM response
+            confidence_raw = parsed_allocation.get("confidence", parsed_allocation.get("confidence_score"))
+            confidence_score = None
+            if confidence_raw is not None:
+                try:
+                    confidence_score = float(confidence_raw)
+                except (TypeError, ValueError):
+                    logger.warning(f"[ExternalRunId {external_run_id}] Could not parse confidence: {confidence_raw}")
+                    confidence_score = None
+                    validation_warnings.append({
+                        "color": "yellow",
+                        "title": "Confidence Score Invalid",
+                        "description": "AI returned invalid confidence value. Defaulting to 0.",
+                    })
+
+            # If LLM didn't return confidence after retry, default to 0 with warning
+            if confidence_score is None:
+                logger.warning(f"[ExternalRunId {external_run_id}] LLM did not return confidence, defaulting to 0.0")
+                confidence_score = 0.0
+                validation_warnings.append({
+                    "color": "yellow",
+                    "title": "Confidence Score Unavailable",
+                    "description": "AI could not assess confidence level. Defaulting to 0 (low confidence).",
+                })
 
             # Build structured warnings from context
             # Get competitor info from snapshot (Stage 2-4 pipeline doesn't have stage1_result)
@@ -1439,9 +2016,20 @@ async def _run_stages_2_to_4_pipeline(
                 parsed_allocation=parsed_allocation,
                 total_budget=float(total_budget_val) if total_budget_val else None,
                 competitor_data=competitors_with_data,
-                historical_spend=None,  # Not available in Stage 2-4 only path
+                historical_spend=customer_historical_spend,  # Now extracted from snapshot
                 excluded_competitors=excluded_competitors,
             )
+
+            # Add validation warnings (from retry logic, missing channels, etc.)
+            structured_warnings.extend(validation_warnings)
+
+            # Add historical spend warning if applicable
+            if historical_spend_warning:
+                structured_warnings.append(historical_spend_warning)
+
+            # Check guardrail violations (warnings only, values not modified)
+            guardrail_warnings = _check_guardrail_violations(allocations, external_run_id)
+            structured_warnings.extend(guardrail_warnings)
 
             allocation_result = {
                 "run_id": external_run_id,
@@ -1449,31 +2037,17 @@ async def _run_stages_2_to_4_pipeline(
                 "total_budget_eur": total_budget_val,
                 "kpi_projection": kpi_projection,
                 "reasoning_summary": parsed_allocation.get("summary", parsed_allocation.get("reasoning_summary", "")),
-                "confidence_score": parsed_allocation.get("confidence", parsed_allocation.get("confidence_score", 0.85)),
+                "confidence_score": confidence_score,  # Use extracted/defaulted value, not raw
                 "warnings": structured_warnings,
                 "is_cached": False,
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
             }
 
-            # DEBUG: Save final result and create ZIP
-            if get_settings().stage1_debug_mode:
-                with open(f"{debug_dir}/08_final_result.json", "w", encoding="utf-8") as f:
-                    json.dump(allocation_result, f, indent=2, ensure_ascii=False)
-                logger.info(f"[ExternalRunId {external_run_id}] Debug files saved to {debug_dir}/")
-
-                zip_path = f"debug_output/run_{external_run_id}.zip"
-                try:
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                        for root, dirs, files in os.walk(debug_dir):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                arcname = os.path.relpath(file_path, debug_dir)
-                                zipf.write(file_path, arcname)
-                    shutil.rmtree(debug_dir)
-                    logger.info(f"[ExternalRunId {external_run_id}] Debug ZIP created: {zip_path}")
-                except Exception as zip_error:
-                    logger.warning(f"[ExternalRunId {external_run_id}] Failed to create debug ZIP: {zip_error}")
+            with open(f"{debug_dir}/08_final_result.json", "w", encoding="utf-8") as f:
+                json.dump(allocation_result, f, indent=2, ensure_ascii=False)
+            logger.info(f"[ExternalRunId {external_run_id}] Artifact files saved to {debug_dir}/")
+            _create_artifact_zip(external_run_id, debug_dir)
 
             # Store result
             ai_run.allocationResult = allocation_result
@@ -1482,6 +2056,7 @@ async def _run_stages_2_to_4_pipeline(
             ai_run.updatedAt = datetime.utcnow()
             ai_run.progressPct = 100
             ai_run.stage = None
+            _persist_trace_snapshot(ai_run, stage1_ai_calls, stage2_ai_calls, did_retry)
             flag_modified(ai_run, 'allocationResult')  # JSONB column needs explicit flag
 
             await session.commit()
@@ -1821,6 +2396,215 @@ DEBUG_BUNDLE_MAP = {
 
 # Files that indicate Stage 1 was run (for n=1 and n=2 bundles)
 STAGE1_INDICATOR_FILES = ["01_industry_resolution.json", "05_filtered_data.json"]
+
+ARTIFACT_META = {
+    1: {"name": "stage1_discovery", "label": "Stage 1 Data Discovery"},
+    2: {"name": "filtered_data_llm", "label": "Filtered Data & LLM Input"},
+    3: {"name": "allocation_output", "label": "Allocation Output"},
+}
+
+ARTIFACT_INDICATOR_FILES = {
+    1: "01_industry_resolution.json",
+    2: "05_filtered_data.json",
+    3: "08_final_result.json",
+}
+
+IN_PROGRESS_RUN_STATUSES = {
+    "pending",
+    "matching",
+    "awaiting_confirmation",
+    "generating",
+    "parsing",
+    "completing",
+}
+
+_RUN_STATUS_MAP = {
+    "pending": RunStatus.PENDING,
+    "matching": RunStatus.MATCHING,
+    "awaiting_confirmation": RunStatus.AWAITING_CONFIRMATION,
+    "generating": RunStatus.GENERATING,
+    "parsing": RunStatus.PARSING,
+    "completing": RunStatus.FEEDBACK,
+    "completed": RunStatus.COMPLETED,
+    "failed": RunStatus.FAILED,
+    "cancelled": RunStatus.CANCELLED,
+}
+
+
+def _list_artifact_files(run_id: int) -> set[str]:
+    """List artifact filenames from the run directory and/or ZIP archive."""
+    files: set[str] = set()
+    run_dir = _artifact_run_dir(run_id)
+    if os.path.isdir(run_dir):
+        files.update(os.listdir(run_dir))
+    zip_path = _artifact_zip_path(run_id)
+    if os.path.exists(zip_path):
+        try:
+            with zipfile.ZipFile(zip_path, "r") as z:
+                files.update(z.namelist())
+        except zipfile.BadZipFile:
+            pass
+    return files
+
+
+def _stage1_ran(available_files: set[str]) -> bool:
+    return "01_industry_resolution.json" in available_files
+
+
+def _compute_run_duration_seconds(ai_run: PrismaProjectVersionAiRun) -> Optional[float]:
+    if not ai_run.startedAt:
+        return None
+    end = ai_run.completedAt
+    effective_status = ai_run.status or "pending"
+    if not end and effective_status in ("failed", "cancelled", "completed"):
+        end = ai_run.updatedAt
+    elif not end and effective_status not in ("pending",):
+        end = datetime.utcnow()
+    if not end:
+        return None
+    return (end - ai_run.startedAt).total_seconds()
+
+
+def _build_artifact_status(
+    run_id: int,
+    artifact_number: int,
+    run_status: str,
+    available_files: set[str],
+    stage1_ran: bool,
+) -> RunArtifactStatus:
+    meta = ARTIFACT_META[artifact_number]
+    expected_files = DEBUG_BUNDLE_MAP[artifact_number]
+    present_files = [f for f in expected_files if f in available_files]
+    missing_files = [f for f in expected_files if f not in available_files]
+    files_found = len(present_files)
+    files_expected = len(expected_files)
+    indicator = ARTIFACT_INDICATOR_FILES[artifact_number]
+    download_url = f"/api/v1/runs/{run_id}/debug-zip?n={artifact_number}"
+
+    if run_status in IN_PROGRESS_RUN_STATUSES and not present_files:
+        status = "pending"
+        message = (
+            "Run is still in progress. Artifacts will become available when each stage completes."
+        )
+        download_available = False
+    elif artifact_number in (1, 2) and not stage1_ran:
+        status = "unavailable"
+        message = "Not available — Stage 1 was skipped for this run."
+        download_available = False
+    elif artifact_number == 3 and indicator not in available_files and "07_parsed_response.json" not in available_files:
+        if run_status == "failed":
+            status = "unavailable"
+            message = "Not available — run did not produce allocation output."
+        elif run_status in IN_PROGRESS_RUN_STATUSES:
+            status = "pending"
+            message = "Allocation output is not ready yet."
+        else:
+            status = "unavailable"
+            message = "Allocation output files are not available for this run."
+        download_available = False
+    elif files_found == files_expected:
+        status = "available"
+        if artifact_number == 1:
+            message = "All Stage 1 files are ready to download."
+        elif artifact_number == 2:
+            message = "All Stage 2 input files are ready to download."
+        else:
+            message = "Allocation output is ready to download."
+        download_available = True
+    elif indicator in available_files or present_files:
+        status = "partial"
+        if run_status == "failed":
+            if artifact_number == 1:
+                message = "Run failed before all Stage 1 files were generated."
+            elif artifact_number == 2:
+                message = "Run failed before all Stage 2 input files were generated."
+            else:
+                message = "Run failed before all allocation output files were generated."
+        else:
+            message = "Some files are available; download will include partial content."
+        download_available = True
+    else:
+        status = "unavailable"
+        if artifact_number in (1, 2):
+            message = "Not available — Stage 1 did not complete successfully."
+        else:
+            message = "Not available — run did not produce allocation output."
+        download_available = False
+
+    file_statuses = [
+        RunArtifactFileStatus(filename=f, present=f in available_files)
+        for f in expected_files
+    ]
+
+    return RunArtifactStatus(
+        artifact_number=artifact_number,
+        name=meta["name"],
+        label=meta["label"],
+        status=status,
+        files_found=files_found,
+        files_expected=files_expected,
+        missing_files=missing_files,
+        message=message,
+        download_available=download_available,
+        download_url=download_url,
+        files=file_statuses,
+    )
+
+
+@router.get(
+    "/{run_id}/artifacts",
+    response_model=RunArtifactsResponse,
+    responses={
+        200: {"description": "Run artifacts and metrics retrieved"},
+        404: {"model": ErrorResponse, "description": "Run not found"},
+    },
+)
+async def get_run_artifacts(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get run metrics and artifact availability for the user-facing artifacts panel.
+
+    The run_id is the externalRunId from ProjectVersionAiRun.
+    """
+    ai_run = await get_ai_run_by_external_id(db, run_id)
+    if not ai_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run with externalRunId {run_id} not found",
+        )
+
+    effective_status = ai_run.status or "pending"
+    mapped_status = _RUN_STATUS_MAP.get(effective_status, RunStatus.PENDING)
+    available_files = _list_artifact_files(run_id)
+    stage1_ran = _stage1_ran(available_files)
+
+    trace = ai_run.traceSnapshot or {}
+    llm_calls_count = trace.get("llm_calls_count")
+    llm_breakdown = None
+    if trace:
+        llm_breakdown = {
+            "stage1_ai_calls": trace.get("stage1_ai_calls"),
+            "stage2_ai_calls": trace.get("stage2_ai_calls"),
+            "stage2_retry": trace.get("stage2_retry"),
+        }
+
+    artifacts = [
+        _build_artifact_status(run_id, n, effective_status, available_files, stage1_ran)
+        for n in (1, 2, 3)
+    ]
+
+    return RunArtifactsResponse(
+        run_id=run_id,
+        run_status=mapped_status,
+        started_at=ai_run.startedAt,
+        completed_at=ai_run.completedAt,
+        duration_seconds=_compute_run_duration_seconds(ai_run),
+        llm_calls_count=llm_calls_count,
+        llm_calls_breakdown=llm_breakdown,
+        error_message=ai_run.errorMessage,
+        artifacts=artifacts,
+    )
 
 
 @router.get(

@@ -120,6 +120,10 @@ class StartRunRequest(BaseModel):
         None,
         description="Frontend flag: True=user changed media channels. Informational only - never affects Stage 1 skip; passed to Stage 2 prompt."
     )
+    skip_competitor_fetch: Optional[bool] = Field(
+        None,
+        description="Frontend flag: True=skip Stage 1 entirely regardless of definition_changed, use existing confirmedCompetitors from DB."
+    )
 
 
 class StartRunResponse(BaseModel):
@@ -128,3 +132,40 @@ class StartRunResponse(BaseModel):
     run_id: int
     status: str = Field(..., description="'started' or 'error'")
     error_message: Optional[str] = None
+
+
+class RunArtifactFileStatus(BaseModel):
+    """Presence of a single file within a run artifact bundle."""
+
+    filename: str
+    present: bool
+
+
+class RunArtifactStatus(BaseModel):
+    """Availability of one downloadable run artifact."""
+
+    artifact_number: int = Field(..., ge=1, le=3)
+    name: str
+    label: str
+    status: str = Field(..., description="available | partial | unavailable | pending")
+    files_found: int
+    files_expected: int
+    missing_files: List[str] = Field(default_factory=list)
+    message: Optional[str] = None
+    download_available: bool
+    download_url: str
+    files: Optional[List[RunArtifactFileStatus]] = None
+
+
+class RunArtifactsResponse(BaseModel):
+    """Run metrics and artifact availability for the user-facing artifacts panel."""
+
+    run_id: int
+    run_status: RunStatus
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    llm_calls_count: Optional[int] = None
+    llm_calls_breakdown: Optional[Dict[str, Any]] = None
+    error_message: Optional[str] = None
+    artifacts: List[RunArtifactStatus]

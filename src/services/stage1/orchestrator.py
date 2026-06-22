@@ -220,6 +220,7 @@ class Stage1Orchestrator:
                 user_industry=input.industry,
                 yougov_sectors=yougov_sectors,
                 nielsen_sectors=nielsen_sectors,
+                debug_logger=debug_logger,
             )
             ai_calls += 1
 
@@ -344,6 +345,7 @@ class Stage1Orchestrator:
                     customer_brand=input.brand_name,
                     nielsen_marke=confirmed_nielsen,
                     produktmarke_list=all_produktmarke,
+                    debug_logger=debug_logger,
                 )
                 ai_calls += 1
 
@@ -419,6 +421,7 @@ class Stage1Orchestrator:
                 brand_kpi=input.brand_kpi,
                 max_competitors=10,
                 customer_nielsen_brand=confirmed_nielsen,
+                debug_logger=debug_logger,
             )
             ai_calls += 1
 
@@ -573,6 +576,7 @@ class Stage1Orchestrator:
                             customer_brand=comp.brand_label,  # Use competitor name as context
                             nielsen_marke=comp.nielsen_brand,
                             produktmarke_list=comp_all_pm,
+                            debug_logger=debug_logger,
                         )
                         ai_calls += 1
                         comp_relevant_pm = comp_pm_result.relevant if comp_pm_result.relevant else comp_all_pm

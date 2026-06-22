@@ -70,9 +70,10 @@ def _save_debug_file(
             generating one from timestamp + step_name
 
     Returns:
-        Path to saved file, or None if debug mode is off
+        Path to saved file, or None if debug mode is off and not a production artifact
     """
-    if not is_debug_mode():
+    # Production artifact filenames (01_*.json … 05_*.json) are always saved
+    if not is_debug_mode() and not filename_override:
         return None
 
     timestamp = timestamp or datetime.now()
@@ -120,7 +121,7 @@ class Stage1DebugLogger:
         """
         self.run_id = str(run_id)
         self.start_time = datetime.now()
-        self.enabled = is_debug_mode()
+        self.enabled = True  # Production run artifacts are always saved
         self._saved_files: List[str] = []
 
     def log_step_y1_industry_resolution(
@@ -395,3 +396,48 @@ class Stage1DebugLogger:
         if not self.enabled:
             return None
         return str(_get_debug_dir() / f"run_{self.run_id}")
+
+    def save_y1_prompt(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Save Y1 (Industry Resolution) AI prompt."""
+        if not self.enabled:
+            return None
+        run_dir = _get_debug_dir() / f"run_{self.run_id}"
+        run_dir.mkdir(exist_ok=True)
+        filepath = run_dir / "Y1_prompt.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=== SYSTEM PROMPT ===\n")
+            f.write(system_prompt)
+            f.write("\n\n=== USER PROMPT ===\n")
+            f.write(user_prompt)
+        self._saved_files.append(str(filepath))
+        return str(filepath)
+
+    def save_y2_prompt(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Save Y2 (Brand and Competitor Suggestion) AI prompt."""
+        if not self.enabled:
+            return None
+        run_dir = _get_debug_dir() / f"run_{self.run_id}"
+        run_dir.mkdir(exist_ok=True)
+        filepath = run_dir / "Y2_prompt.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=== SYSTEM PROMPT ===\n")
+            f.write(system_prompt)
+            f.write("\n\n=== USER PROMPT ===\n")
+            f.write(user_prompt)
+        self._saved_files.append(str(filepath))
+        return str(filepath)
+
+    def save_n1_prompt(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Save N1 (Produktmarke Filtering) AI prompt."""
+        if not self.enabled:
+            return None
+        run_dir = _get_debug_dir() / f"run_{self.run_id}"
+        run_dir.mkdir(exist_ok=True)
+        filepath = run_dir / "N1_prompt.txt"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("=== SYSTEM PROMPT ===\n")
+            f.write(system_prompt)
+            f.write("\n\n=== USER PROMPT ===\n")
+            f.write(user_prompt)
+        self._saved_files.append(str(filepath))
+        return str(filepath)

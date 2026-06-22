@@ -17,6 +17,9 @@ from src.api.schemas.runs import (
     RunListResponse,
     StartRunRequest,
     StartRunResponse,
+    RunArtifactFileStatus,
+    RunArtifactStatus,
+    RunArtifactsResponse,
 )
 from src.api.schemas.competitors import (
     CompetitorBrand,
@@ -71,6 +74,9 @@ __all__ = [
     "RunListResponse",
     "StartRunRequest",
     "StartRunResponse",
+    "RunArtifactFileStatus",
+    "RunArtifactStatus",
+    "RunArtifactsResponse",
     # Competitors
     "CompetitorBrand",
     "BrandInfo",
