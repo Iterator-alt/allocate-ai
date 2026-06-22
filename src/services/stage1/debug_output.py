@@ -70,9 +70,10 @@ def _save_debug_file(
             generating one from timestamp + step_name
 
     Returns:
-        Path to saved file, or None if debug mode is off
+        Path to saved file, or None if debug mode is off and not a production artifact
     """
-    if not is_debug_mode():
+    # Production artifact filenames (01_*.json … 05_*.json) are always saved
+    if not is_debug_mode() and not filename_override:
         return None
 
     timestamp = timestamp or datetime.now()
@@ -120,7 +121,7 @@ class Stage1DebugLogger:
         """
         self.run_id = str(run_id)
         self.start_time = datetime.now()
-        self.enabled = is_debug_mode()
+        self.enabled = True  # Production run artifacts are always saved
         self._saved_files: List[str] = []
 
     def log_step_y1_industry_resolution(

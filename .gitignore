@@ -87,3 +87,6 @@ debug_output/
 openapi_*.json
 downloaded_test.zip
 nul
+
+#docs
+docs/
